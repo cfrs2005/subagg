@@ -57,6 +57,22 @@ to force one.
 - **Sharing** — issue a separate, individually revocable token per friend, and see
   the real access log (when, which client, how many distinct sources).
 
+## Screenshots
+
+### Node management
+
+Filter, inspect, and test every node in one compact workspace. The included
+example has been redacted before publication.
+
+![Node management workspace](./assets/screenshots/node-management.png)
+
+### Chain proxy configuration
+
+Choose entry and landing nodes for an optional relay route, while keeping the
+normal subscription unchanged.
+
+![Chain proxy configuration](./assets/screenshots/chain-proxy-configuration.png)
+
 ## Quick start
 
 Requires Node.js ≥ 20.11.
