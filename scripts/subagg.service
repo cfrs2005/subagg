@@ -1,0 +1,48 @@
+# subagg systemd unit —— VPS 直接部署（非 Docker）路径
+#
+# 安装步骤：
+#   sudo useradd --system --home /opt/subagg --shell /usr/sbin/nologin subagg
+#   sudo git clone <repo> /opt/subagg && cd /opt/subagg
+#   sudo -u subagg npm ci && sudo -u subagg npm run build
+#   sudo -u subagg cp .env.example .env && sudo -u subagg vi .env   # 填 ADMIN_TOKEN / IP_HASH_SALT
+#   sudo chmod 600 /opt/subagg/.env
+#   sudo cp scripts/subagg.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now subagg
+#
+# 查看日志： journalctl -u subagg -f
+
+[Unit]
+Description=subagg — proxy subscription aggregator
+Documentation=https://github.com/your-org/subagg
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=subagg
+Group=subagg
+WorkingDirectory=/opt/subagg
+EnvironmentFile=/opt/subagg/.env
+ExecStart=/usr/bin/node /opt/subagg/dist/index.js
+Restart=on-failure
+RestartSec=5s
+
+# ── 加固 ──────────────────────────────────────────────
+# 本服务持有代理凭据，尽量收紧权限面
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+# 只有数据目录可写
+ReadWritePaths=/opt/subagg/data
+
+[Install]
+WantedBy=multi-user.target

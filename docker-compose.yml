@@ -1,0 +1,29 @@
+# subagg —— 容器化部署样例
+#
+# 使用前：
+#   1. cp .env.example .env
+#   2. 填入 ADMIN_TOKEN 与 IP_HASH_SALT（openssl rand -hex 32 / -hex 16）
+#   3. docker compose up -d
+#
+# 端口默认只绑定回环。要对外提供服务，请在前面挂一层反向代理并启用 HTTPS，
+# 不要把 8787 直接暴露到公网 —— 数据库里存的是你的代理凭据（详见 SECURITY.md）。
+
+services:
+  subagg:
+    build: .
+    image: subagg:local
+    container_name: subagg
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:8787:8787'
+    env_file:
+      - .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: '8787'
+      DB_PATH: /data/subagg.db
+    volumes:
+      - subagg-data:/data
+
+volumes:
+  subagg-data:

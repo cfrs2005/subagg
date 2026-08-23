@@ -1,0 +1,32 @@
+# 依赖与构建产物
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# 运行时数据 —— 内含代理凭据，绝对不能提交
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+
+# 环境变量 —— 内含 ADMIN_TOKEN
+.env
+.env.*
+!.env.example
+
+# 本地项目记录与代理工作说明 —— 不随开源仓库发布
+docs/
+AGENTS.md
+CLAUDE.md
+
+# 日志
+*.log
+logs/
+
+# 编辑器与系统
+.DS_Store
+.idea/
+.vscode/
+*.swp

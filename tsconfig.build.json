@@ -1,0 +1,11 @@
+{
+  /* 生产构建：只编译 src/，不含测试与配置文件。
+     rootDir 收窄到 src，使产物落在 dist/*.js 而不是 dist/src/*.js。 */
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "public", "test"]
+}
