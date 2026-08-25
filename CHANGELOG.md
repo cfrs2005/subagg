@@ -11,7 +11,28 @@
 - Light theme is now the default, with a persistent dark-theme switch.
 - Token expiry, cumulative or rolling access quotas, source alerts, token-level burst limiting, rotation, and access-log pruning.
 
+- **二维码出码**：订阅链接与单节点 URI 均可生成二维码，扫码即可导入客户端。
+  编码器自研（`src/core/qrcode.ts`，纯函数、零新增依赖），**全程本地计算、
+  零外部请求** —— 这条链接等同于全部节点的访问凭证，不会交给任何第三方出码服务。
+  内容超出可靠出码上限时明确拒绝并给出可操作提示，绝不产出一张扫不出来的码。
+- 三层限流（IP / 链接 / 配额）现在各自记结构化日志，并通过 `X-Subagg-Limit`
+  响应头标明是哪一层拦的 —— 一条 `curl -I` 就能区分，不必再猜。
+
 ### Fixed
+- **ClashX Meta 被误判为原版 Clash 内核**。UA 识别正则要求 `clash` 与 `meta`
+  之间最多隔一个分隔符，而 `ClashX Meta` 中间夹着 `X`，于是落到通用 Clash 规则，
+  链式代理节点与 VLESS / Hysteria2 / TUIC 被整批跳过。裸的 ClashX / ClashX Pro
+  仍正确识别为原版内核。
+- **`/sub` 与 `/api` 的错误从未走过自定义错误处理**。`setErrorHandler` 与
+  `setNotFoundHandler` 注册在各 `register()` 之后，而 Fastify 的处理器按封装上下文
+  继承 —— 子插件只继承注册那一刻已有的处理器。后果是这两组路由的错误不脱敏、
+  不记日志，5xx 还会把内部错误信息原样回显。两个处理器已前移到路由注册之前。
+- **鉴权失败日志会写入明文订阅 token**。`redact()` 只对 `http(s)://` 开头的字符串
+  做 URL 脱敏，而 `path: req.url` 是相对路径，于是
+  `/api/tokens/<明文 token>/revoke` 被原样落盘。新增 `redactPath()`，并在
+  `redact()` 中对 `path` 字段自动应用。
+- 限流触发时的 429 响应统一为 `text/plain` 并带 `Retry-After`。此前 IP 层返回 JSON，
+  代理客户端会先拿它当配置解析，最终报"配置解析失败"，把排查引向错误方向。
 - Preview statistics and preview body now use the same node limit and filter pass.
 - Fingerprint credential fields now use an unambiguous separator. Existing SS/SSR/TUIC fingerprints and saved picks are recalculated after upgrade.
 

@@ -56,6 +56,10 @@ to force one.
   history, and re-emits an aggregated header so your client shows a usage bar.
 - **Sharing** — issue a separate, individually revocable token per friend, and see
   the real access log (when, which client, how many distinct sources).
+- **Local QR codes** — generate a scannable code for a subscription link or a single
+  node URI. The encoder is a self-contained pure function: **everything is computed
+  locally with zero outbound requests** — that link is equivalent to credentials for
+  every node, so it is never handed to a third-party QR service.
 
 ## Screenshots
 
