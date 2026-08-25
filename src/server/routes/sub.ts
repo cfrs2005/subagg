@@ -16,8 +16,8 @@
 
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 import type { AppContext } from '../../context.js';
-import { fileExtensionFor } from '../../core/emit/index.js';
-import { hashIp } from '../../db/repo/sharing.js';
+import { fileExtensionFor, sniffClient } from '../../core/emit/index.js';
+import { hashIp, tokenRef } from '../../db/repo/sharing.js';
 import { renderProfile } from '../../services/render.js';
 
 /**
@@ -95,7 +95,21 @@ export function createSubRoutes(ctx: AppContext): FastifyPluginAsync {
         if ('isExceeded' in tokenRate && tokenRate.isExceeded) {
           const retryAfter = Math.max(1, Math.ceil(tokenRate.ttl / 1000));
           reply.header('retry-after', String(retryAfter));
-          return reply.code(429).type('text/plain; charset=utf-8').send('订阅链接请求过于频繁');
+          reply.header('x-subagg-limit', 'token');
+          reply.header('cache-control', 'no-store');
+          ctx.limitStats.hit('token');
+          ctx.logger.warn('订阅请求被限流', {
+            layer: 'token',
+            ref: tokenRef(token),
+            ipHash: hashIp(req.ip, ctx.config.ipHashSalt),
+            client: sniffClient(req.headers['user-agent']).client,
+            retryAfter,
+            limit: ctx.config.subTokenRateLimit,
+          });
+          return reply
+            .code(429)
+            .type('text/plain; charset=utf-8')
+            .send(`订阅链接请求过于频繁，请在 ${retryAfter} 秒后重试`);
         }
 
         const since = check.token.quotaWindowHours === null
@@ -105,9 +119,30 @@ export function createSubRoutes(ctx: AppContext): FastifyPluginAsync {
         const state = ctx.tokens.tokenState(check.token, usage);
         if (state.state === 'quota') {
           if (state.rolling) {
-            reply.header('retry-after', String(Math.max(1, Math.ceil((state.retryAfterMs ?? 60_000) / 1000))));
-            return reply.code(429).type('text/plain; charset=utf-8').send('订阅链接在当前时间窗口内已达到拉取次数上限');
+            const retryAfter = Math.max(1, Math.ceil((state.retryAfterMs ?? 60_000) / 1000));
+            reply.header('retry-after', String(retryAfter));
+            reply.header('x-subagg-limit', 'quota');
+            reply.header('cache-control', 'no-store');
+            ctx.limitStats.hit('quota');
+            ctx.logger.warn('订阅请求被限流', {
+              layer: 'quota',
+              ref: tokenRef(token),
+              ipHash: hashIp(req.ip, ctx.config.ipHashSalt),
+              client: sniffClient(req.headers['user-agent']).client,
+              retryAfter,
+            });
+            return reply
+              .code(429)
+              .type('text/plain; charset=utf-8')
+              .send(`订阅链接在当前时间窗口内已达到拉取次数上限，请在 ${retryAfter} 秒后重试`);
           }
+          // 累计型配额耗尽是**永久**状态，不会自己恢复 ——
+          // 所以既不给 429（那暗示"稍后重试"，是假的），也不给 Retry-After。
+          ctx.logger.warn('订阅请求被拒绝', {
+            reason: 'quota-exhausted',
+            ref: tokenRef(token),
+            client: sniffClient(req.headers['user-agent']).client,
+          });
           return reply.code(404).type('text/plain; charset=utf-8').send('拉取次数已用尽');
         }
 
@@ -152,7 +187,9 @@ export function createSubRoutes(ctx: AppContext): FastifyPluginAsync {
             const current = ctx.tokens.usageForToken(token, Date.now() - 30 * 86400_000);
             if (current.distinctSources >= sourceLimit) {
               ctx.logger.warn('订阅 token 来源数达到告警阈值', {
-                token,
+                // 用 ref 而不是整条 token：后者会被 redact 打成 `Ab3***xyz`，
+                // 既漏了头尾又没法回查，两头不讨好。
+                ref: tokenRef(token),
                 distinctSources: current.distinctSources,
                 sourceLimit,
               });
@@ -196,6 +233,9 @@ export function createSubRoutes(ctx: AppContext): FastifyPluginAsync {
         }
 
         ctx.logger.info('订阅已下发', {
+          // 与被限流时记的 ref 同源，成功与被拒才能串成同一条链接的时间线 ——
+          // 排查"他说更新失败"时，这是唯一有用的视图。
+          ref: tokenRef(token),
           profile: profile.name,
           client: result.client,
           target: result.target,

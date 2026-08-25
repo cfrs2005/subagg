@@ -14,6 +14,7 @@ import { ProfileRepo } from './db/repo/profiles.js';
 import { AccessLogRepo, FriendRepo, TokenRepo } from './db/repo/sharing.js';
 import { SubscriptionRepo, TrafficRepo } from './db/repo/subscriptions.js';
 import type { Logger } from './logger.js';
+import { LimitStats } from './services/limit-stats.js';
 import { Scheduler } from './services/scheduler.js';
 import { NodePingService } from './services/node-ping.js';
 import { SyncService } from './services/sync.js';
@@ -35,6 +36,8 @@ export interface AppContext {
   sync: SyncService;
   nodePing: NodePingService;
   scheduler: Scheduler;
+  /** 限流命中计数。进程内，重启清零 —— 展示时必须带上 since。 */
+  limitStats: LimitStats;
 }
 
 /** 构建上下文。会打开数据库并执行迁移。 */
@@ -50,6 +53,7 @@ export function createContext(config: Config, logger: Logger): AppContext {
   const accessLog = new AccessLogRepo(db);
   const pingHistory = new PingHistoryRepo(db);
 
+  const limitStats = new LimitStats();
   const sync = new SyncService({ config, logger, subscriptions, nodes, traffic });
   const nodePing = new NodePingService({ config, logger, nodes, history: pingHistory });
   const scheduler = new Scheduler({
@@ -76,5 +80,6 @@ export function createContext(config: Config, logger: Logger): AppContext {
     sync,
     nodePing,
     scheduler,
+    limitStats,
   };
 }
