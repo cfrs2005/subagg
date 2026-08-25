@@ -69,6 +69,10 @@ interface UaPattern {
  *    里含有 "Clash"，先匹配到通用规则的话会被当成原版内核，
  *    于是 VLESS / Hysteria2 节点被无谓地跳过。
  * 2. **Stash / Verge 这类不含 "meta" 字样的 Meta 内核客户端要单独列出。**
+ * 3. **"clash" 与 "meta" 之间可能夹着产品名。** ClashX Meta 的 UA 是
+ *    `ClashX Meta/1.4.9`（也见过 `ClashXMeta` / `ClashX.Meta` 三种写法），
+ *    中间那个 `X` 曾让它整个漏出 Meta 分支、被当成原版内核 ——
+ *    链式节点与 VLESS / Hysteria2 / TUIC 一并被跳过。故用 `[x]?` 兜住。
  *
  * 判不准时宁可判成能力更弱的目标：多跳过几个节点，用户看到提示后能自己改；
  * 而把 VLESS 塞给原版 Clash 会导致**整份配置加载失败**，破坏性大得多。
@@ -78,8 +82,10 @@ const UA_PATTERNS: readonly UaPattern[] = [
   { re: /shadowrocket/i, client: 'Shadowrocket', target: 'shadowrocket' },
 
   // ── Clash.Meta / mihomo 系（必须在通用 Clash 之前）────
+  // `clash[x]?[.\-_ ]?meta` 要同时命中 clash 与 meta 两段，
+  // 所以裸的 ClashX / ClashX Pro（真·原版内核）不会被误收进来。
   {
-    re: /mihomo|clash[.\-_ ]?meta|clash-?verge|verge|stash|flclash|nyanpasu|clashmi/i,
+    re: /mihomo|clash[x]?[.\-_ ]?meta|clash-?verge|verge|stash|flclash|nyanpasu|clashmi/i,
     client: 'Clash.Meta',
     target: 'clash.meta',
   },
@@ -87,6 +93,8 @@ const UA_PATTERNS: readonly UaPattern[] = [
   // ── 原版 Clash 内核 ───────────────────────────────────
   // ClashX Pro / Clash for Windows / Clash for Android 都基于 Premium 内核，
   // 不支持 VLESS / Hysteria2 / TUIC。
+  // 注意 ClashX 与 ClashX Meta 是两个独立项目：前者是原版内核，
+  // 后者内核是 mihomo、支持 dialer-proxy，已由上一条规则接走。
   { re: /clash/i, client: 'Clash', target: 'clash' },
 
   // ── V2Ray 系（消费 base64 URI 列表）───────────────────

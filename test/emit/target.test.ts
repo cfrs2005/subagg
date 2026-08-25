@@ -41,6 +41,25 @@ describe('UA 嗅探', () => {
     expect(sniffClient('FlClash/0.8.60')).toMatchObject({ target: 'clash.meta' });
   });
 
+  it('ClashX Meta：clash 与 meta 之间夹着产品名也要认出来', () => {
+    // ClashX Meta 内核是 mihomo、支持 dialer-proxy，但 UA 里 "Clash" 与 "Meta"
+    // 中间夹了个 "X"。曾因此漏出 Meta 分支被判成原版内核，
+    // 导致链式节点与 VLESS / Hysteria2 / TUIC 一并被跳过。
+    // 三种发行写法都见过，一个都不能漏。
+    expect(sniffClient('ClashX Meta/1.4.9')).toMatchObject({ target: 'clash.meta' });
+    expect(sniffClient('ClashXMeta/1.4.9')).toMatchObject({ target: 'clash.meta' });
+    expect(sniffClient('ClashX.Meta/1.4.9')).toMatchObject({ target: 'clash.meta' });
+    expect(sniffClient('ClashX Meta/1.3.6 (darwin arm64)')).toMatchObject({
+      target: 'clash.meta',
+    });
+
+    // 反向守卫：裸的 ClashX / ClashX Pro 是真·原版内核，不能被上面的放宽误收。
+    // 这两条与「原版 Clash 内核」用例重复是有意的 —— 放在这里，
+    // 改动 Meta 正则的人一眼就能看到边界在哪。
+    expect(sniffClient('ClashX/1.118.0')).toMatchObject({ target: 'clash' });
+    expect(sniffClient('ClashX Pro/1.97.2')).toMatchObject({ target: 'clash' });
+  });
+
   it('V2Ray 系客户端', () => {
     expect(sniffClient('v2rayN/6.45')).toMatchObject({ target: 'v2ray' });
     expect(sniffClient('v2rayNG/1.8.23')).toMatchObject({ target: 'v2ray' });
