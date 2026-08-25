@@ -420,6 +420,27 @@ export function hashIp(ip: string, salt: string): string {
   return createHmac('sha256', salt).update(ip).digest('hex').slice(0, 16);
 }
 
+/**
+ * 取 token 的短标识，用于日志里指认"是哪条链接"。
+ *
+ * token 是 32 字节随机数的 base64url（43 字符）。露出头 8 个字符约 48 bit，
+ * 剩下的 ~208 bit 依然不可爆破 —— 而 `logger.ts` 的 `mask()` 对长值本来
+ * 就保留头 3 尾 3，这里并不比既有姿态更宽松。
+ *
+ * 用前缀而不是 HMAC，是为了能直接回查：
+ *   SELECT label, friend_id FROM tokens WHERE token LIKE 'Ab3xY9_q%'
+ * HMAC 得先把全表算一遍才能对上，排查时这点摩擦是致命的。
+ *
+ * ⚠️ **拿它当日志字段时，字段名不能含 token / key / auth 等字样。**
+ * `logger.ts` 的 `SENSITIVE_KEYS` 是**大小写不敏感的子串**匹配，
+ * `tokenRef` 会命中 `token`、`limitKey` 会命中 `key`，双双被打成 `'***'`；
+ * 而 `mask()` 对长度 ≤ 8 的值直接返回 `'***'`，打码后信息量为零。
+ * 统一叫 `ref`。
+ */
+export function tokenRef(token: string): string {
+  return token.slice(0, 8);
+}
+
 export interface RecordAccessInput {
   token: string;
   profileId: string;

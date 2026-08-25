@@ -69,22 +69,51 @@ function mask(value: string): string {
 export function redactUrl(raw: string): string {
   try {
     const url = new URL(raw);
-
-    // 查询参数一律打码（不逐个判断键名 —— 机场的参数名五花八门）
-    for (const key of [...url.searchParams.keys()]) {
-      const value = url.searchParams.get(key);
-      if (value) url.searchParams.set(key, mask(value));
-    }
-
-    // 路径里长度可疑的段视为 token
-    const segments = url.pathname.split('/').map((seg) => (seg.length >= 12 ? mask(seg) : seg));
-    url.pathname = segments.join('/');
-
+    redactSearchParams(url);
+    url.pathname = redactPathname(url.pathname);
     url.username = '';
     url.password = '';
     return url.toString();
   } catch {
     // 连 URL 都解析不了的字符串，无法判断哪部分敏感 —— 整体打码
+    return mask(raw);
+  }
+}
+
+/** 查询参数一律打码（不逐个判断键名 —— 机场的参数名五花八门）。 */
+function redactSearchParams(url: URL): void {
+  for (const key of [...url.searchParams.keys()]) {
+    const value = url.searchParams.get(key);
+    if (value) url.searchParams.set(key, mask(value));
+  }
+}
+
+/** 路径里长度可疑的段视为 token。 */
+function redactPathname(pathname: string): string {
+  return pathname
+    .split('/')
+    .map((seg) => (seg.length >= 12 ? mask(seg) : seg))
+    .join('/');
+}
+
+/**
+ * 对**相对路径**脱敏，例如 `/api/tokens/<43 字符 token>/revoke`。
+ *
+ * 单独一个函数是必要的：`redact()` 对裸字符串只在它以 `http(s)://` 开头时才
+ * 走 `redactUrl`，而 `req.url` 拿到的是相对路径 —— 于是
+ * `{ path: '/api/tokens/<明文 token>/revoke' }` 这样的日志会**原样落盘**。
+ * 鉴权失败的分支恰好就这么记，等于把订阅凭据写进了 journald。
+ *
+ * 脱敏放在 logger 层而不是各个调用点，是因为"记得手动脱敏"这件事
+ * 迟早会有人忘 —— 而忘掉的代价是凭据泄漏。
+ */
+export function redactPath(raw: string): string {
+  try {
+    // 相对路径没有 origin，给一个丢弃用的 base 才能借 URL 解析 query
+    const url = new URL(raw, 'http://placeholder.invalid');
+    redactSearchParams(url);
+    return redactPathname(url.pathname) + url.search;
+  } catch {
     return mask(raw);
   }
 }
@@ -114,6 +143,10 @@ export function redact(value: unknown, depth = 0): unknown {
         out[key] = typeof v === 'string' ? mask(v) : '***';
       } else if (lower === 'url' && typeof v === 'string') {
         out[key] = redactUrl(v);
+      } else if (lower === 'path' && typeof v === 'string' && v.startsWith('/')) {
+        // `path` 字段几乎总是 req.url，里面常带明文 token（`/sub/xxx`、
+        // `/api/tokens/xxx/revoke`）。它不以 http:// 开头，走不进上面那条分支。
+        out[key] = redactPath(v);
       } else {
         out[key] = redact(v, depth + 1);
       }
