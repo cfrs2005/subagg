@@ -20,8 +20,10 @@ import type { AppContext } from '../../context.js';
 import { EMIT_TARGETS, TARGET_LABELS, emitUri, type EmitTarget } from '../../core/emit/index.js';
 import { applyFilter, DEFAULT_EXCLUDE_PATTERNS, type FilterRule } from '../../core/filter.js';
 import { knownRegionCodes, regionNameZh, regionToFlag } from '../../core/region.js';
+import { encodeQr, renderQrSvg } from '../../core/qrcode.js';
 import { PROXY_TYPES, type ProxyType } from '../../core/types.js';
 import type { UserinfoMode } from '../../core/userinfo.js';
+import { tokenRef } from '../../db/repo/sharing.js';
 import { renderProfile } from '../../services/render.js';
 import { expandChain } from '../../core/chain.js';
 import { requireAdmin } from '../auth.js';
@@ -352,6 +354,45 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
       return { uri: emitUri(node) };
     });
 
+    // 二维码与上面的 /uri 是同一类出口：都吐完整凭据，都一次一条。
+    // 出码在本地算（src/core/qrcode.ts），不经任何第三方服务 ——
+    // 这条链接等同于节点的访问凭证，交出去一份就少一分。
+    app.get<{ Params: { fingerprint: string } }>('/nodes/:fingerprint/qrcode', async (req, reply) => {
+      const node = ctx.nodes.listAll().find((n) => n.fingerprint === req.params.fingerprint);
+      if (!node) return reply.code(404).send({ error: '节点不存在' });
+
+      const uri = emitUri(node);
+      if (uri === null) {
+        return reply.code(422).send({ error: `${node.type} 暂不支持导出为 URI，无法生成二维码` });
+      }
+
+      const result = encodeQr(uri, { minEcc: 'M' });
+      if (!result.ok) {
+        // 给出**可操作**的下一步，而不是只说"太长了"
+        return reply.code(422).send({
+          error:
+            `节点 URI 有 ${result.byteLength} 字节，超出可扫二维码的上限 ${result.capacity} 字节` +
+            ` —— 通常是节点名过长。请用「复制 URI」手动导入，或在配置的重命名规则里缩短节点名。`,
+        });
+      }
+
+      ctx.logger.info('生成节点二维码', {
+        fingerprint: node.fingerprint,
+        type: node.type,
+        version: result.matrix.version,
+        ecc: result.matrix.ecc,
+      });
+      // 响应体等同凭据，不该进磁盘缓存
+      reply.header('cache-control', 'no-store');
+      return {
+        svg: renderQrSvg(result.matrix, { title: '节点二维码' }),
+        version: result.matrix.version,
+        ecc: result.matrix.ecc,
+        size: result.matrix.size,
+        byteLength: uri.length,
+      };
+    });
+
     app.get<{ Params: { fingerprint: string } }>('/nodes/:fingerprint/ping/history', async (req, reply) => {
       const node = ctx.nodes.listAll().find((item) => item.fingerprint === req.params.fingerprint);
       if (!node) return reply.code(404).send({ error: '节点不存在' });
@@ -495,6 +536,36 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
       });
       const base = ctx.config.publicBaseUrl.replace(/\/+$/, '');
       return reply.code(201).send({ ...token, url: `${base}/sub/${token.token}` });
+    });
+
+    app.get<{ Params: { token: string } }>('/tokens/:token/qrcode', async (req, reply) => {
+      const record = ctx.tokens.get(req.params.token);
+      if (!record) return reply.code(404).send({ error: 'token 不存在' });
+
+      // 与 GET /tokens 用同一份拼接逻辑，唯一真源是 publicBaseUrl ——
+      // 否则界面上显示的链接和二维码里的链接可能对不上
+      const base = ctx.config.publicBaseUrl.replace(/\/+$/, '');
+      // 订阅链接固定在 80 字节量级，用 Q 级纠错只多几个模块，
+      // 换来屏幕反光、斜角拍摄下的容错，白拿的余量
+      const result = encodeQr(`${base}/sub/${record.token}`, { minEcc: 'Q' });
+      if (!result.ok) {
+        return reply.code(422).send({ error: `${result.reason}。请检查 PUBLIC_BASE_URL 是否异常` });
+      }
+
+      ctx.logger.info('生成订阅链接二维码', {
+        // 刻意不记 token 明文
+        ref: tokenRef(record.token),
+        profileId: record.profileId,
+        version: result.matrix.version,
+        ecc: result.matrix.ecc,
+      });
+      reply.header('cache-control', 'no-store');
+      return {
+        svg: renderQrSvg(result.matrix, { title: '订阅链接二维码' }),
+        version: result.matrix.version,
+        ecc: result.matrix.ecc,
+        size: result.matrix.size,
+      };
     });
 
     app.patch<{ Params: { token: string } }>('/tokens/:token', async (req, reply) => {

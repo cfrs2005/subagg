@@ -572,7 +572,7 @@ function openNodeDetail(node) {
   const statusLabel = status === 'online' ? '在线' : status === 'offline' ? '离线' : '未测试';
   openModal(`
     <div class="node-modal-head"><div><div class="detail-kicker">NODE DETAIL</div><h2>${regionFlag(node.region)} ${esc(node.name)}</h2><p>${esc(node.sourceName)} · ${esc(node.type.toUpperCase())}</p></div><button class="node-modal-close" data-action="close-modal" aria-label="关闭节点详情">×</button></div>
-    <div class="node-modal-actions"><span class="status-pill ${status}"><i></i>${statusLabel}</span><button class="btn-sec" data-action="ping-node" data-fp="${esc(node.fingerprint)}">ϟ 测试连接</button><button class="btn-sec" data-action="copy-node" data-fp="${esc(node.fingerprint)}">↗ 复制 URI</button></div>
+    <div class="node-modal-actions"><span class="status-pill ${status}"><i></i>${statusLabel}</span><button class="btn-sec" data-action="ping-node" data-fp="${esc(node.fingerprint)}">ϟ 测试连接</button><button class="btn-sec" data-action="copy-node" data-fp="${esc(node.fingerprint)}">↗ 复制 URI</button><button class="btn-sec" data-action="node-qr" data-fp="${esc(node.fingerprint)}" data-value="${esc(node.name)}">▦ 二维码</button></div>
     <div class="node-detail-grid"><div><span>地区</span><strong>${regionTag(node.region, node.region)}</strong></div><div><span>服务器</span><strong class="detail-code">${esc(node.server)}</strong></div><div><span>端口</span><strong>${node.port}</strong></div><div><span>TCP 延迟</span><strong class="${status === 'online' ? 'metric-ok' : ''}">${ping?.ok ? `${ping.latencyMs ?? 0}ms` : '—'}</strong></div><div><span>最近测试</span><strong>${ping ? fmtTime(ping.checkedAt) : '尚未测试'}</strong></div><div><span>节点指纹</span><strong class="detail-code">${esc(node.fingerprint)}</strong></div></div>
     <section class="latency-history"><div class="latency-history-head"><div><div class="detail-kicker">LATENCY HISTORY</div><h3>延迟趋势</h3></div><span>每 ${state.meta?.nodePingIntervalHours ?? 12} 小时自动测试</span></div><div id="nodeLatencyHistory" data-fingerprint="${esc(node.fingerprint)}"><div class="latency-history-empty">正在读取最近 90 天数据…</div></div></section>
     <p class="node-modal-note">测试只建立 TCP 连接，不发送代理凭据；结果不表示代理认证成功。历史保留最近 90 天。</p>`, true, 'node-detail-modal');
@@ -917,6 +917,60 @@ function openModal(html, wide = false, variant = '') {
 function closeModal() {
   overlay.classList.remove('open');
   modalEl.innerHTML = '';
+}
+
+// ── 二维码弹窗 ────────────────────────────────────────
+//
+// 出码在服务端本地算（src/core/qrcode.ts），不经任何第三方服务。
+// 返回的是 SVG 字符串，直接 innerHTML 进 DOM。
+//
+// 关于这里为什么可以不 esc()：SVG 是我们自己生成的，二维码内容是被**编码成
+// 比特画进矩阵**的，从来不以字符串形式出现在输出里 —— 输出字符集只有
+// `<svg path rect d M h v z>`、数字、颜色和固定的中文 title。这跟 esc() 的
+// 场景不同：那是"不可信字符串必须中和后才能进 HTML"，这里是"输出里根本
+// 没有不可信字符串"。前者是防御，后者是结构上的不可能。
+// test/qrcode.test.ts 里有一条断言把这个不变式锁进了 CI。
+// 周边的名称、错误消息等仍然全部照旧过 esc()。
+let qrRequestSeq = 0;
+
+async function openQrModal({ src, title, subtitle, back }) {
+  const seq = ++qrRequestSeq;
+  const backBtn = back
+    ? `<button class="btn-sec" data-action="qr-back" data-kind="${esc(back.kind)}" data-id="${esc(back.id)}">← 返回</button>`
+    : `<button class="btn-sec" data-action="close-modal">关闭</button>`;
+
+  const shell = (body) => `
+    <div class="modal-title">${esc(title)}</div>
+    ${subtitle ? `<div class="modal-sub">${esc(subtitle)}</div>` : ''}
+    ${body}
+    <div class="modal-actions">${backBtn}</div>`;
+
+  openModal(shell('<div class="qr-canvas"><div class="qr-loading">正在生成…</div></div>'), false, 'qr-modal');
+
+  try {
+    const data = await api.get(src);
+    if (seq !== qrRequestSeq) return; // 期间又打开了别的码，丢弃这次结果
+    if (typeof data.svg !== 'string' || !/^<svg[\s>]/.test(data.svg)) {
+      throw new Error('二维码响应格式异常');
+    }
+    const dense = data.version >= 20
+      ? `<div class="qr-dense-warn">⚠ 二维码较密（版本 ${data.version}），扫不出时把浏览器放大到 150% 或全屏再试。</div>`
+      : '';
+    openModal(
+      shell(
+        `<div class="qr-canvas">${data.svg}</div>
+         <div class="qr-meta">版本 ${data.version} · 纠错 ${esc(data.ecc)} · ${data.size}×${data.size} 模块 · 本地生成，未经过任何第三方</div>
+         ${dense}
+         <div class="modal-hint">这张码等同于访问凭证。别让它出现在直播画面、会议投屏或公开截图里。</div>`,
+      ),
+      false,
+      'qr-modal',
+    );
+  } catch (err) {
+    if (seq !== qrRequestSeq) return;
+    // 超长节点那条提示信息量大，toast 三秒就没了，得留在弹窗里
+    openModal(shell(`<div class="qr-error">${esc(err.message)}</div>`), false, 'qr-modal');
+  }
 }
 
 overlay.addEventListener('click', (e) => {
@@ -1671,6 +1725,7 @@ function linksModal(profileId) {
           t.revoked
             ? `<span class="ptag">已吊销</span><button class="icobtn" data-action="token-access" data-token="${esc(t.token)}">📊</button><button class="icobtn danger" data-action="delete-token" data-token="${esc(t.token)}">🗑 清理</button>`
             : `<button class="icobtn" data-action="copy-token" data-url="${esc(t.url)}">复制</button>
+               <button class="icobtn" data-action="token-qr" data-token="${esc(t.token)}" data-id="${esc(profileId)}" data-value="${esc(t.label || '未命名')}">二维码</button>
                <button class="icobtn" data-action="edit-token" data-token="${esc(t.token)}">编辑</button>
                <button class="icobtn" data-action="token-access" data-token="${esc(t.token)}">📊</button>
                <button class="icobtn" data-action="rotate-token" data-token="${esc(t.token)}">轮换</button>
@@ -1689,8 +1744,9 @@ function linksModal(profileId) {
       <strong>一条链接，各客户端通用。</strong>
       Clash / Clash.Meta / Shadowrocket / v2rayN 会被自动识别，各自拿到对应格式；
       需要强制指定时在链接后加 <code>?target=clash.meta</code>（可选值：clash、clash.meta、shadowrocket、v2ray）。<br><br>
-      <strong>不提供二维码。</strong>生成二维码需要把链接交给第三方服务，
-      而这条链接等同于你全部节点的访问凭证 —— 不值得为了方便承担这个风险。
+      <strong>二维码本地生成。</strong>这条链接等同于你全部节点的访问凭证，
+      所以它不会被交给任何第三方二维码服务 —— 码由本服务自己算出来，全程零外部请求。
+      也正因为如此，请继续把它当凭证看待：别让它出现在直播画面、会议投屏或公开截图里。
     </div>
 
     <div class="modal-actions">
@@ -1883,6 +1939,36 @@ document.addEventListener('click', async (e) => {
         await copyText(uri);
         break;
       }
+
+      case 'node-qr':
+        await openQrModal({
+          src: `/nodes/${encodeURIComponent(fp)}/qrcode`,
+          title: '节点二维码',
+          subtitle: value ?? '',
+          back: { kind: 'node', id: fp },
+        });
+        break;
+
+      case 'token-qr':
+        // 传 token 而不是前端拼好的 url：出码内容由服务端按 publicBaseUrl 拼，
+        // 单一真源，免得界面显示的链接与码里的不一致
+        await openQrModal({
+          src: `/tokens/${encodeURIComponent(token)}/qrcode`,
+          title: '订阅链接二维码',
+          subtitle: value ?? '',
+          back: { kind: 'token', id },
+        });
+        break;
+
+      case 'qr-back':
+        if (kind === 'node') {
+          const node = state.nodes.find((n) => n.fingerprint === id);
+          if (node) openNodeDetail(node);
+          else closeModal();
+        } else {
+          linksModal(id);
+        }
+        break;
 
       case 'ping-node': {
         const result = await pingNode(fp);

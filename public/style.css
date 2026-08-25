@@ -795,3 +795,38 @@ body { background: #f7f7f4; color: #202124; }
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* ── 二维码弹窗 ────────────────────────────────────────
+   .qr-canvas 必须恒为白底、不跟随主题变量：暗色模式下静区被"吃掉"
+   会直接导致扫不出来。SVG 自身也画了白色背景矩形，这里是双保险。 */
+.qr-modal .qr-canvas {
+  background: #fff;
+  border-radius: 10px;
+  padding: 14px;
+  width: 300px;
+  height: 300px;
+  margin: 4px auto 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .16);
+}
+.qr-modal .qr-canvas svg { display: block; width: 100%; height: 100%; }
+.qr-loading { font-size: 12px; color: #667; }
+.qr-meta { font-size: 11px; color: var(--text3); text-align: center; margin-bottom: 10px; }
+.qr-dense-warn {
+  font-size: 11px;
+  color: var(--warn, #b4690e);
+  text-align: center;
+  margin-bottom: 10px;
+  line-height: 1.6;
+}
+.qr-error {
+  font-size: 12px;
+  color: var(--text2);
+  line-height: 1.7;
+  padding: 18px 14px;
+  background: var(--s2);
+  border-radius: 10px;
+  margin-bottom: 14px;
+}
