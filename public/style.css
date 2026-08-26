@@ -17,6 +17,13 @@
   --row-hover: #f8fafc; --inset: #f8fafc; --disabled-o: .55; --overlay: rgb(0 0 0 / .42);
   --vless-rgb: 99 102 241; --vmess-rgb: 63 185 80; --trojan-rgb: 210 153 34; --ss-rgb: 248 81 73;
   --ssr-rgb: 236 72 153; --hysteria-rgb: 56 189 248; --tuic-rgb: 168 85 247; --muted-rgb: 125 133 144;
+  /*
+   * 产品主色（橙）。**不是 --accent 的别名**：--accent 是靛蓝，用在表单聚焦、
+   * chip 选中这类"系统交互"上；橙色是工作台外壳的品牌色，用在激活态标签页、
+   * 主按钮、以及 IX 页那些"被标记的行/胶囊"上。两者语义不同，不能互相顶替。
+   * --brand-rgb 让半透明底走 rgb(var(--brand-rgb) / .12)，与协议色同一写法。
+   */
+  --brand: #ea580c; --brand-fg: #c2410c; --brand-rgb: 234 88 12;
   --r: 8px; --r2: 12px; color-scheme: light;
 }
 [data-theme="dark"] {
@@ -24,7 +31,9 @@
   --border: #30363d; --accent: #6366f1; --accent-fg: #a5b4fc; --adim: rgb(99 102 241 / .18);
   --text: #e6edf3; --text2: #7d8590; --text3: #484f58; --ok: #3fb950; --ok-fg: #7ee787;
   --warn: #d29922; --warn-fg: #e3b341; --danger: #f85149; --danger-fg: #ffa198;
-  --row-hover: rgb(22 27 34 / .7); --inset: #0d1117; --disabled-o: .45; --overlay: rgb(0 0 0 / .65); color-scheme: dark;
+  --row-hover: rgb(22 27 34 / .7); --inset: #0d1117; --disabled-o: .45; --overlay: rgb(0 0 0 / .65);
+  /* 深色下橙色必须调亮：#ea580c 在 #161b22 上只有 2.6:1，读不清。 */
+  --brand: #fb923c; --brand-fg: #fdba74; --brand-rgb: 251 146 60; color-scheme: dark;
 }
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -430,11 +439,18 @@ tr:hover .nact { opacity: 1; }
 .pe-filter-block .chip-group { gap: 6px; }
 .profile-editor .chip, .profile-editor-page .chip { background: #fff; border-color: #d5d9d4; color: #56616c; }
 .profile-editor .chip:hover, .profile-editor .chip.on, .profile-editor-page .chip:hover, .profile-editor-page .chip.on { border-color: var(--pe-accent); color: #c2410c; background: #fff7ed; }
-.pe-switch { display: inline-flex; align-items: center; gap: 8px; color: var(--pe-muted); font-size: 11px; white-space: nowrap; }
+/*
+ * --pe-* 只定义在 .modal.profile-editor / .profile-editor-page 上，而 IX 页也用
+ * .pe-switch / .pe-empty —— 在那里 var(--pe-accent) 是**无效值**，整条声明被丢掉：
+ * 打开的开关和关闭的开关长得一模一样（真实存在过的 bug，看着像状态没保存）。
+ * 所以这几处都带上主题变量兜底，编辑器内仍优先用它自己的橙。
+ */
+.pe-switch { display: inline-flex; align-items: center; gap: 8px; color: var(--pe-muted, var(--text2)); font-size: 11px; white-space: nowrap; }
 .pe-switch input { position: absolute; opacity: 0; pointer-events: none; }
-.pe-switch span { position: relative; display: block; width: 34px; height: 20px; border-radius: 999px; background: #d1d5db; transition: background .15s; }
+.pe-switch span { position: relative; display: block; width: 34px; height: 20px; border-radius: 999px; background: var(--s4); transition: background .15s; }
+/* 滑块恒为白：它靠位置而不是对比度表达状态，两个主题下都得是一颗看得见的实心球。 */
 .pe-switch span::after { content: ''; position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: transform .15s; box-shadow: 0 1px 3px rgb(0 0 0 / .2); }
-.pe-switch input:checked + span { background: var(--pe-accent); }
+.pe-switch input:checked + span { background: var(--pe-accent, var(--brand)); }
 .pe-switch input:checked + span::after { transform: translateX(14px); }
 .pe-role-summary { display: grid; grid-template-columns: minmax(0, 1fr) 32px minmax(0, 1fr); gap: 10px; align-items: center; margin-bottom: 18px; }
 .pe-role { min-width: 0; padding: 12px; border: 1px solid var(--pe-line); border-radius: 9px; background: #fafaf8; }
@@ -465,7 +481,7 @@ tr:hover .nact { opacity: 1; }
 .pe-candidate-actions { display: flex; flex: 0 0 auto; gap: 5px; }
 .pe-add-btn { padding: 5px 8px; border: 1px solid var(--pe-line); border-radius: 6px; background: #fff; color: #64748b; font-size: 10px; }
 .pe-add-btn:hover, .pe-add-btn.selected { border-color: var(--pe-accent); color: #c2410c; background: #fff7ed; }
-.pe-empty { color: var(--pe-muted); font-size: 10px; }
+.pe-empty { color: var(--pe-muted, var(--text2)); font-size: 10px; }
 .pe-empty-large { padding: 35px; text-align: center; }
 .pe-chain-options { display: grid; grid-template-columns: minmax(0, 1fr) 120px auto; gap: 12px; align-items: end; margin-top: 14px; }
 .pe-direct { padding-bottom: 8px; white-space: nowrap; }
@@ -830,3 +846,102 @@ body { background: #f7f7f4; color: #202124; }
   border-radius: 10px;
   margin-bottom: 14px;
 }
+
+/* ── IX 中转 ────────────────────────────────────────
+   沿用 .settings-card / .ntable / .pbar 那一套（同一个产品的浅色卡片语言），
+   只补 IX 特有的：线路配额条、状态徽章、映射表的行内错误。 */
+.ix-body { display: flex; flex-direction: column; gap: 16px; max-width: 1240px; }
+.ix-provider-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(440px, 1fr)); gap: 16px; }
+.ix-provider-card .ix-provider-url { margin-top: 5px; color: var(--text2); font-family: "SFMono-Regular", Consolas, monospace; font-size: 10px; overflow-wrap: anywhere; }
+.ix-switch-row { display: flex; flex-wrap: wrap; gap: 20px; padding: 14px 0 4px; }
+.ix-switch-row .pe-switch b { color: var(--text); font-size: 11px; font-weight: 700; }
+.ix-section-title { margin: 4px 0 9px; color: var(--text2); font-size: 10px; font-weight: 800; letter-spacing: .9px; text-transform: uppercase; }
+.ix-line { padding: 10px 12px; margin-bottom: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--inset); }
+.ix-line-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; color: var(--text2); font-size: 11px; }
+.ix-line-head b { color: var(--text); font-size: 12px; }
+.ix-line-tag { padding: 1px 6px; border-radius: 999px; background: rgb(var(--brand-rgb) / .14); color: var(--brand-fg); font-size: 9px; font-weight: 700; }
+.ix-line-entry { font-family: "SFMono-Regular", Consolas, monospace; overflow-wrap: anywhere; }
+.ix-quota { margin-left: auto; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
+/*
+ * 配额数字用 *-fg 变体而不是 --ok / --warn / --danger 本体：本体是给实心底
+ * 与进度条填充用的中间调，直接当文字放在卡片底上，深色主题下只有 3 点几比一。
+ */
+.ix-quota.q-ok { color: var(--ok-fg); }
+.ix-quota.q-warn { color: var(--warn-fg); }
+.ix-quota.q-bad { color: var(--danger-fg); }
+.ix-line-note { margin-top: 6px; color: var(--danger-fg); font-size: 10px; line-height: 1.5; }
+.ix-unavail { margin: 6px 0 0 18px; font-size: 11px; line-height: 1.75; }
+.ix-card-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 16px; }
+.ix-card-actions .btn-sec { background: var(--s1); border-color: var(--border); color: var(--text); }
+.ix-card-actions .btn-sec, .ix-card-actions .btn-danger { padding: 6px 12px; font-size: 12px; }
+.ix-map-card { padding: 20px; background: var(--s1); border: 1px solid var(--border); border-radius: 12px; }
+.ix-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.ix-card-head h2 { margin-top: 4px; color: var(--text); font-size: 16px; }
+.ix-card-head p { margin-top: 5px; color: var(--text2); font-size: 11px; line-height: 1.6; }
+.ix-count-pill { padding: 6px 10px; border: 1px solid rgb(var(--brand-rgb) / .38); border-radius: 999px; background: rgb(var(--brand-rgb) / .14); color: var(--brand-fg); font-size: 11px; white-space: nowrap; }
+/* 卡片里的通用说明文字。--text3 在深色下只有约 1.9:1，这一格必须读得清。 */
+.ix-provider-card .field-hint { color: var(--text2); }
+.ix-latency-note { line-height: 1.7; }
+.ix-table { min-width: 1220px; }
+.ix-table tr { cursor: default; }
+/*
+ * 孤儿行用**品牌橙**而不是 --warn：这一页 --warn 已经被"已挂起"和 UDP"未知"
+ * 占了，再挤进来就把三个不同处置方式的状态压成同一个颜色。橙色同时也是
+ * `.ntable tr.selected` 那条 inset 竖条的颜色，语义一致：这一行被标记了。
+ */
+.ix-table tr.is-orphan td { background: rgb(var(--brand-rgb) / .1); }
+.ix-table tr.is-orphan td:first-child { box-shadow: inset 3px 0 var(--brand); }
+.ix-mono { font-family: "SFMono-Regular", Consolas, monospace; font-size: 11px; color: var(--text2); overflow-wrap: anywhere; }
+.ix-row-name { display: block; color: var(--text); font-size: 11px; font-weight: 650; }
+/*
+ * 副标题行（指纹、孤儿计数、"点同步拉真实值"）。刻意用 --text2 而不是 --text3：
+ * 深色下 --text3 是 #484f58，在 --s1 上只有约 1.9:1，纯装饰级——而这几行都带
+ * 可操作信息。层级靠 9px + 等宽区分，不靠把字压到看不见。
+ */
+.ix-row-fp { display: block; margin-top: 3px; color: var(--text2); font-family: "SFMono-Regular", Consolas, monospace; font-size: 9px; overflow-wrap: anywhere; }
+.ix-row-err { margin-top: 5px; max-width: 260px; color: var(--danger-fg); font-size: 10px; line-height: 1.5; overflow-wrap: anywhere; }
+.ix-state { display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px; border-radius: 999px; font-size: 9px; font-weight: 700; white-space: nowrap; }
+.ix-state i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.ix-badge { display: inline-flex; align-items: center; padding: 3px 7px; border-radius: 999px; font-size: 9px; font-weight: 700; white-space: nowrap; }
+/*
+ * 徽章底色沿用 .t-* / .shared-badge / .rtag.unknown 那套 rgb(var(--*-rgb) / a)
+ * 半透明写法：同一条规则在两个主题下都成立，不必写两份。
+ */
+.ix-state.s-active, .ix-badge.s-active { color: var(--ok-fg); background: rgb(var(--vmess-rgb) / .16); }
+.ix-state.s-pending, .ix-badge.s-pending { color: var(--text2); background: rgb(var(--muted-rgb) / .16); }
+.ix-state.s-error, .ix-badge.s-error { color: var(--danger-fg); background: rgb(var(--ss-rgb) / .16); }
+.ix-state.s-suspended, .ix-badge.s-suspended { color: var(--warn-fg); background: rgb(var(--trojan-rgb) / .16); }
+/*
+ * 孤儿要能在一屏表格里被一眼扫到，所以是唯一一个实心底色的徽章。
+ * 前景用 --bg（浅色主题下近白、深色主题下近黑）——实心底上的反色文字必须
+ * 跟着主题翻转，写死 #fff 在深色的亮橙底上只有 1.7:1。
+ */
+.ix-state.s-orphan, .ix-badge.s-orphan { color: var(--bg); background: var(--brand); }
+/* 节点表的「中转」格可能同时出现状态徽章与"不转 UDP"徽章 */
+.ix-badge + .ix-badge { margin-left: 4px; }
+/*
+ * 端口级 UDP 三态。沿用 .ix-state 的胶囊语言，只换配色语义：
+ * 转发=绿、不转发=红、未知=琥珀。**未知刻意不用灰**——灰在这套界面里读作
+ * "没这回事"，而这里要读作"该去同步一次"；同时也必须和红色的"不转发"分开，
+ * 否则又变回把未知伪装成事实。
+ */
+.ix-udp { display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px; border-radius: 999px; font-size: 9px; font-weight: 700; white-space: nowrap; cursor: help; }
+.ix-udp i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.ix-udp.u-on { color: var(--ok-fg); background: rgb(var(--vmess-rgb) / .16); }
+.ix-udp.u-off, .ix-badge.u-off { color: var(--danger-fg); background: rgb(var(--ss-rgb) / .16); }
+.ix-udp.u-unknown { color: var(--warn-fg); background: rgb(var(--trojan-rgb) / .16); }
+.ix-udp-cell { white-space: nowrap; }
+.ix-udp-note { line-height: 1.7; }
+.ix-udp-note .btn-sec { display: block; margin-top: 9px; padding: 6px 12px; background: var(--s1); border-color: var(--border); color: var(--text); font-size: 12px; }
+.ix-traffic { color: var(--text2); font-size: 10px; line-height: 1.6; white-space: nowrap; }
+.ix-row-actions { white-space: nowrap; }
+.ix-row-actions .icobtn { margin-left: 4px; background: var(--s1); border-color: var(--border); color: var(--text2); }
+.ix-row-actions .icobtn:hover { border-color: var(--brand); color: var(--brand-fg); }
+.ix-row-actions .icobtn.danger:hover { border-color: var(--danger); color: var(--danger); }
+/* "待分配" / "—" 是占位但仍要读得清，同样避开深色下形同隐形的 --text3。 */
+.ix-cell-none { color: var(--text2); }
+.ix-auth-group[hidden] { display: none; }
+.pe-ix-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; align-items: start; }
+.pe-ix-card .ix-fill-warn { margin: 10px 0 0; font-size: 11px; }
+.pe-ix-card .ix-fill-warn[hidden] { display: none; }
+@media (max-width: 760px) { .ix-provider-grid { grid-template-columns: 1fr; } }

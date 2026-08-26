@@ -18,7 +18,54 @@
 - 三层限流（IP / 链接 / 配额）现在各自记结构化日志，并通过 `X-Subagg-Limit`
   响应头标明是哪一层拦的 —— 一条 `curl -I` 就能区分，不必再猜。
 
+- **IX 中转编排**：产品定位从"订阅聚合"扩展为"订阅聚合 + 中转编排"。
+  由 subagg 去 L4 端口转发平台建/认领转发端口，生成订阅时把节点的拨号地址换成
+  中转入口（`客户端 → IX 入口 → 原落地`）。**只改 `server` 与 `port`**，
+  UUID / 密码 / TLS / SNI / Host / path 等协议参数与直连版逐字节一致。
+  改写发生在渲染期、**绝不入库**，所以指纹不变，手动勾选与 ping 历史都不受影响；
+  管线位置固定为 `filter → ix → chain → emit`。默认关闭。
+  - **生效范围与回退**：per-profile 开关（`rule.ix.enabled`）+ 中转商级
+    **全局总闸**。映射不可用时如实回落直连，逐节点原因走 `X-Subagg-IX`
+    与 `X-Subagg-IX-Reason` 响应头以及界面。渲染热路径**零出站请求** ——
+    平台挂了、限流了、过期了，订阅照常下发。
+  - **SNI / Host 补写**（`fillOriginHost`，默认开）：把原 server 显式写进
+    `tls.sni` / `ws.headers.Host` / `h2.host` / `http.headers.Host`。
+    这 4 处原本靠"缺省回落到 `server`"隐式生效，改 server 就等于悄悄改了它们，
+    所以补写不是新增语义，而是把已生效的默认值固化下来。
+  - **保守拒绝清单**：REALITY 缺 sni、ss 带 obfs 插件、ssr 用了需要 Host 的混淆、
+    明文 gRPC、UDP 系协议（hysteria2 / tuic / QUIC）落在不转发 UDP 的端口后面 ——
+    一律不改写、保持直连，并给出中文原因 + 可操作的下一步。
+  - **认证双模**：`X-API-Key`（首选，长期）与账号密码换 JWT（实测 7 天有效，
+    到期前 5 分钟主动重登，401 再重登一次）。
+  - **凭据加密**：AES-256-GCM 落库，密钥从 `ADMIN_TOKEN` 派生。防的是"库文件被
+    单独带走"，**不防主机沦陷**；**轮换 `ADMIN_TOKEN` 后已存凭据无法解密**，
+    需重新录入（界面提示 + 回落直连，服务不崩）。
+  - **幂等三层**：本地映射表 → 远端按目标**精确**认领（服务端 `target` 是子串
+    模糊匹配，必须在客户端再精确比一次）→ 节点上的 `ix` 标记防二次改写。
+  - 端口配额按**线路级**预检；节点消失只标孤儿并在界面高亮，
+    **绝不自动删远端端口**。
+  - 界面新增「IX 中转」页（中转商卡片、线路与配额、映射表、孤儿高亮），
+    节点表新增「中转」列与「建立 IX 转发」批量入口，配置文件编辑页新增 IX 面板。
+- 新增管理 API（均走 Bearer 鉴权，**凭据只进不出**）：
+  `GET|POST /api/ix/providers`、`PATCH|DELETE /api/ix/providers/:id`、
+  `POST /api/ix/providers/:id/probe`、`GET|POST /api/ix/mappings`、
+  `DELETE /api/ix/mappings/:fingerprint`、`POST /api/ix/refresh` 共 9 个端点。
+- 新增环境变量：`IX_SYNC_INTERVAL_HOURS`（默认 6，**0 = 禁用后台同步**，
+  不影响订阅下发）、`IX_TIMEOUT_MS`（默认 15000）、
+  `IX_ORPHAN_THRESHOLD`（默认 5，连续几轮没见到节点才标孤儿）。
+- 数据库迁移：新增 version 4 `ix_forwarding`（`ix_providers` +
+  `ix_port_mappings`）与 version 5 `ix_port_udp`（给映射加 `entry_udp`，
+  三态：1 转 UDP / 0 不转 / NULL 未同步、事实未知）。
+  只增不改；回滚就是关全局总闸，数据留着不影响既有功能。
+
 ### Fixed
+- **前端 `fmtBytes()` 的兜底分支会把入参原样送进 `innerHTML`**（XSS 路径）。
+  其余分支都经过算术运算、结果必然是数字，只有 < 1000 那条把入参直接带出去 ——
+  而流量字段来自上游与中转平台，理论上可以是任意 JSON 值。流量页与好友页
+  也走同一个函数。已改为 `esc(bytes)`。
+- **`GET /api/nodes/:fingerprint/uri` 缺 `cache-control: no-store`**。
+  CLAUDE.md 声称三个凭据出口都带这个头，实际漏了这一个（两个二维码路由是带的）——
+  响应体等同凭据，却可能被写进磁盘缓存。已补齐，三个出口现在一致。
 - **ClashX Meta 被误判为原版 Clash 内核**。UA 识别正则要求 `clash` 与 `meta`
   之间最多隔一个分隔符，而 `ClashX Meta` 中间夹着 `X`，于是落到通用 Clash 规则，
   链式代理节点与 VLESS / Hysteria2 / TUIC 被整批跳过。裸的 ClashX / ClashX Pro

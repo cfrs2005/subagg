@@ -116,6 +116,22 @@ const ConfigSchema = z.object({
   /** 节点 TCP 探测的最短间隔。每个节点每隔该时长最多自动测试一次。 */
   nodePingIntervalHours: z.coerce.number().int().min(1).max(168).default(12),
 
+  /**
+   * IX 中转状态同步间隔（小时）。**0 表示禁用自动同步。**
+   *
+   * 这只影响"什么时候去中转平台对齐状态"，不影响订阅下发 ——
+   * 渲染只读本地映射，平台挂了订阅照常出。
+   */
+  ixSyncIntervalHours: z.coerce.number().int().min(0).max(168).default(6),
+  /** 调中转平台 API 的单请求超时。它是外部服务，不能让它拖住调度器。 */
+  ixTimeoutMs: z.coerce.number().int().min(1000).max(120000).default(15000),
+  /**
+   * 连续几轮同步没在节点集里见到某个指纹，就把它的映射标成孤儿。
+   *
+   * 不能是 1：机场偶发返回不完整列表很常见，一轮就标孤儿会把健康节点误判。
+   */
+  ixOrphanThreshold: z.coerce.number().int().min(1).max(100).default(5),
+
   /** /sub 端点每 IP 每分钟的请求上限。 */
   subRateLimit: z.coerce.number().int().min(1).default(60),
   /** /sub 端点每个有效 token 每分钟的突发上限。 */
@@ -154,6 +170,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     fetchUserAgent: env['FETCH_USER_AGENT'],
     schedulerIntervalMin: env['SCHEDULER_INTERVAL_MIN'],
     nodePingIntervalHours: env['NODE_PING_INTERVAL_HOURS'],
+    ixSyncIntervalHours: env['IX_SYNC_INTERVAL_HOURS'],
+    ixTimeoutMs: env['IX_TIMEOUT_MS'],
+    ixOrphanThreshold: env['IX_ORPHAN_THRESHOLD'],
     subRateLimit: env['SUB_RATE_LIMIT'],
     subTokenRateLimit: env['SUB_TOKEN_RATE_LIMIT'],
     shareSourceAlert: env['SHARE_SOURCE_ALERT'],

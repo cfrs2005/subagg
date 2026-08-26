@@ -20,6 +20,7 @@ import type { AppContext } from '../context.js';
 import { sniffClient } from '../core/emit/index.js';
 import { hashIp } from '../db/repo/sharing.js';
 import { createAdminRoutes } from './routes/admin.js';
+import { createIxRoutes } from './routes/ix.js';
 import { createSubRoutes } from './routes/sub.js';
 
 /**
@@ -157,6 +158,10 @@ export async function buildApp(ctx: AppContext): Promise<FastifyInstance> {
   // ── 路由 ──────────────────────────────────────────────
   await app.register(createSubRoutes(ctx), { prefix: '/sub' });
   await app.register(createAdminRoutes(ctx), { prefix: '/api' });
+  // IX 中转是 `/api` 下的一组，但**是独立插件**：Fastify 的 hook 按封装上下文
+  // 继承，admin 插件里那句 `addHook('preHandler', requireAdmin(ctx))` 覆盖不到它。
+  // 所以 routes/ix.ts 自己挂了同一个 hook —— 那不是重复，是它唯一的鉴权来源。
+  await app.register(createIxRoutes(ctx), { prefix: '/api/ix' });
 
   // ── 静态前端 ──────────────────────────────────────────
   // 注册在最后：这样 /sub 与 /api 的路由优先匹配，

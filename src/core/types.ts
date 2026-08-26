@@ -145,6 +145,27 @@ export interface ChainLink {
   viaFingerprint: string;
 }
 
+/**
+ * Link metadata for a node whose dial address was swapped for an IX relay entry.
+ *
+ * 存在的第一理由是**幂等**：改写 pass 跑第二遍时 `server` 已经是入口地址，
+ * 于是会把 `tls.sni` 补成入口域名 —— 得到一个"看起来配全了、实际必然握手失败"
+ * 的节点，比不改写危险得多，而且没有任何测试会自然发现它。有了这个标记，
+ * 第二遍能直接认出"已经改过"并跳过。
+ *
+ * 附带收益：界面能显示「经 xx 中转」，`originServer` 让排障能查回原落地地址。
+ */
+export interface IxLink {
+  /** 中转入口主机名 —— 客户端实际拨号的地址，已过 `normalizeHost`。 */
+  entryHost: string;
+  /** 中转入口端口，由中转平台分配。 */
+  entryPort: number;
+  /** 改写前的 server。排障时靠它查回真正的落地机。 */
+  originServer: string;
+  /** 改写前的 port。 */
+  originPort: number;
+}
+
 interface BaseNode {
   /**
    * 稳定指纹，见 fingerprint.ts。
@@ -165,6 +186,8 @@ interface BaseNode {
   meta: NodeMeta;
   /** Set only by core/chain.ts; parsers never accept upstream chain fields. */
   chain?: ChainLink;
+  /** Set only by core/ix.ts; parsers never accept upstream ix fields. */
+  ix?: IxLink;
 }
 
 export interface VmessNode extends BaseNode {

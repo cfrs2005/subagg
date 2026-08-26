@@ -179,7 +179,7 @@ describe('规格表', () => {
 
 describe('编码往返（独立解码器）', () => {
   it('订阅链接', () => {
-    roundTrip('https://miao.20260401.xyz/sub/Ab3xY9_qLmNpQrStUvWxYz0123456789AbCdEfGhIjK', 'Q');
+    roundTrip('https://demo.subagg.local/sub/Ab3xY9_qLmNpQrStUvWxYz0123456789AbCdEfGhIjK', 'Q');
   });
 
   it('七种协议的真实 URI', () => {
@@ -273,7 +273,7 @@ describe('编码往返（独立解码器）', () => {
   });
 
   it('八个掩码都能往返', () => {
-    const text = 'https://miao.20260401.xyz/sub/' + 'A'.repeat(43);
+    const text = 'https://demo.subagg.local/sub/' + 'A'.repeat(43);
     for (let m = 0; m < 8; m++) {
       const r = encodeQr(text, { minEcc: 'M', forceMask: m });
       expect(r.ok).toBe(true);
@@ -354,7 +354,7 @@ describe('容量与边界', () => {
   });
 
   it('免费升级纠错级别：尺寸不变就用更强的纠错', () => {
-    const short = 'https://miao.20260401.xyz/sub/' + 'A'.repeat(43);
+    const short = 'https://demo.subagg.local/sub/' + 'A'.repeat(43);
     const r = encodeQr(short, { minEcc: 'L' });
     expect(r.ok).toBe(true);
     // 同一版本下装得下更高级别时应当升级，绝不降级
@@ -362,7 +362,7 @@ describe('容量与边界', () => {
   });
 
   it('确定性：同输入必得同输出', () => {
-    const text = 'https://miao.20260401.xyz/sub/deterministic-check';
+    const text = 'https://demo.subagg.local/sub/deterministic-check';
     const a = encodeQr(text);
     const b = encodeQr(text);
     expect(a.ok && b.ok).toBe(true);
@@ -374,7 +374,7 @@ describe('容量与边界', () => {
 });
 
 describe('SVG 渲染', () => {
-  const sample = encodeQr('https://miao.20260401.xyz/sub/' + 'A'.repeat(43), { minEcc: 'Q' });
+  const sample = encodeQr('https://demo.subagg.local/sub/' + 'A'.repeat(43), { minEcc: 'Q' });
 
   it('结构正确且自带白色底', () => {
     expect(sample.ok).toBe(true);
@@ -390,7 +390,7 @@ describe('SVG 渲染', () => {
   it('内容绝不出现在输出里', () => {
     // 这条锁死了一个设计不变式：二维码内容是被编码成比特画进矩阵的，
     // 从来不以字符串形式进入 SVG。前端因此可以安全地 innerHTML。
-    const secret = 'https://miao.20260401.xyz/sub/SUPER-SECRET-TOKEN-VALUE-0123456789';
+    const secret = 'https://demo.subagg.local/sub/SUPER-SECRET-TOKEN-VALUE-0123456789';
     const r = encodeQr(secret);
     expect(r.ok).toBe(true);
     if (!r.ok) return;

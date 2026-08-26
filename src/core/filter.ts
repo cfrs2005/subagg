@@ -111,6 +111,32 @@ export interface FilterRule {
   /** 最多保留多少个节点。用于控制配置体积，`0` 或省略表示不限。 */
   limit?: number;
   chain?: ChainRule;
+  ix?: IxRule;
+}
+
+/**
+ * IX 中转改写规则。
+ *
+ * 与 `chain` 一样只是"规则的一部分"，存在 `profiles.rule` 的 JSON 里，不需要迁移。
+ * `applyFilter` **刻意完全不读它** —— 改写发生在 filter 之后的独立 pass
+ * （`core/ix.ts`，理由见该文件头注释）。放在这里只是为了让一份 profile 规则
+ * 能自描述"这条订阅要不要走中转"。
+ */
+export interface IxRule {
+  /** 总开关。省略或 false 都视为不启用（与 `ChainRule.enabled` 同口径）。 */
+  enabled?: boolean;
+  /**
+   * 用哪个中转商的映射。省略时由 services 层决定默认 provider ——
+   * core 层看不到 provider 表，这里只是一个不透明标识。
+   */
+  providerId?: string;
+  /**
+   * 是否把原 server 显式补进 SNI / ws-Host / h2-host / http-Host。默认 true。
+   *
+   * 关掉它等于让这 4 个值回落到中转入口域名，TLS 类节点基本必然握手失败 ——
+   * 只在明确知道后果时用作逃生阀。
+   */
+  fillOriginHost?: boolean;
 }
 
 export interface ChainSelector {

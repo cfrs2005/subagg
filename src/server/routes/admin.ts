@@ -1,6 +1,10 @@
 /**
  * 管理 API（`/api/*`）。全部需要 Bearer 鉴权。
  *
+ * IX 中转那一组（`/api/ix/*`）在 `routes/ix.ts`，是与本文件平级的另一个插件 ——
+ * 那意味着它必须自己挂 `requireAdmin`（hook 按封装上下文生效），见那个文件的头注释。
+ * `/meta` 里仍然要发布 IX 的界面常量，所以本文件从它那里 import 两个共用的常量。
+ *
  * ## 一条贯穿本文件的取舍：节点列表不返回凭据
  *
  * `GET /api/nodes` 返回的是节点的**元信息**（名称、协议、地区、服务器、端口、
@@ -23,10 +27,13 @@ import { knownRegionCodes, regionNameZh, regionToFlag } from '../../core/region.
 import { encodeQr, renderQrSvg } from '../../core/qrcode.js';
 import { PROXY_TYPES, type ProxyType } from '../../core/types.js';
 import type { UserinfoMode } from '../../core/userinfo.js';
+import type { IxAuthMode, IxMappingState } from '../../db/repo/ix.js';
 import { tokenRef } from '../../db/repo/sharing.js';
 import { renderProfile } from '../../services/render.js';
 import { expandChain } from '../../core/chain.js';
 import { requireAdmin } from '../auth.js';
+import { IX_MAX_FINGERPRINTS, type IxAuthModeSchema } from './ix.js';
+import { badRequest } from './validation.js';
 
 // ─────────────────────────────────────────────────────────────
 //  校验 schema
@@ -85,6 +92,23 @@ const ChainRuleSchema = z.object({
 });
 
 /**
+ * IX 中转改写规则。
+ *
+ * **漏了这一段是最贵的一种漏**：schema 不认识的键会被 zod 静默丢掉，
+ * 于是界面上配好的 IX 开关在 `POST /profiles` 时无声消失，
+ * 用户看到的是"开关拨了但订阅还是直连"，而日志里什么都没有。
+ *
+ * 字段名是 `fillOriginHost` 而**不是** `fillSni`：它一次管四处
+ * （`tls.sni` + ws / h2 / http 三个 Host），叫 fillSni 会让人以为只补 SNI。
+ */
+const IxRuleSchema = z.object({
+  enabled: z.boolean().optional(),
+  /** provider id 是 UUID。core 层只当它是不透明标识，这里只卡长度。 */
+  providerId: z.string().min(1).max(64).optional(),
+  fillOriginHost: z.boolean().optional(),
+});
+
+/**
  * 过滤规则的校验。
  *
  * 上限不是随手写的：`limit` 卡在 5000 是因为再多的节点会让生成的 YAML
@@ -106,6 +130,7 @@ const FilterRuleSchema = z.object({
   sort: z.enum(['none', 'name', 'region', 'type', 'source']).optional(),
   limit: z.number().int().min(0).max(5000).optional(),
   chain: ChainRuleSchema.optional(),
+  ix: IxRuleSchema.optional(),
 });
 
 const TARGET_VALUES = [
@@ -186,20 +211,41 @@ const PreviewSchema = z.object({
   limit: z.number().int().min(1).max(200).optional(),
 });
 
+// ── IX 中转（只留 `/meta` 要发布的界面常量；schema 与路由都在 routes/ix.ts）──
+
+/**
+ * 认证模式的界面文案，同时充当**反向**对齐的第一道：
+ * `Record<IxAuthMode, …>` 少一个键就编译失败。第二道在 `/meta` 里 ——
+ * 把键集合再 `satisfies` 一遍 zod 枚举，于是"领域类型加了成员而 schema
+ * 忘了跟进"也会在编译期炸掉，而不是让用户在界面上莫名收到 400。
+ */
+const IX_AUTH_MODE_LABELS: Readonly<Record<IxAuthMode, string>> = {
+  'api-key': 'API Key（长期有效，需平台管理员发放）',
+  login: '账号密码登录（JWT 到期后自动重登）',
+};
+
+const IX_AUTH_MODES = Object.keys(IX_AUTH_MODE_LABELS) as IxAuthMode[];
+
+/** 映射状态的界面文案。同样用 Record 锁住穷尽性。 */
+const IX_STATE_LABELS: Readonly<Record<IxMappingState, string>> = {
+  pending: '待就绪（端口还没建成或还没认领）',
+  active: '生效中',
+  error: '异常（见错误原因）',
+  orphan: '孤儿（节点已从上游消失，远端端口仍占配额）',
+};
+
+const IX_STATES = Object.keys(IX_STATE_LABELS) as IxMappingState[];
+
 // ─────────────────────────────────────────────────────────────
 //  路由
 // ─────────────────────────────────────────────────────────────
 
 export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
   return async function adminRoutes(app: FastifyInstance): Promise<void> {
-    // 整个 /api 前缀下的请求统一鉴权
+    // 整个 /api 前缀下的请求统一鉴权。
+    // 注意这句**只覆盖本插件注册的路由**（Fastify 的 hook 按封装上下文生效），
+    // 所以 routes/ix.ts 那组同前缀的路由必须自己再挂一次。
     app.addHook('preHandler', requireAdmin(ctx));
-
-    /** 统一的校验失败响应。把 zod 的报错整理成人能看懂的形式。 */
-    const badRequest = (issues: z.ZodIssue[]): { error: string; details: string[] } => ({
-      error: '请求参数校验失败',
-      details: issues.map((i) => `${i.path.join('.') || '(根)'}: ${i.message}`),
-    });
 
     // ── 元信息 ────────────────────────────────────────
     // 供界面构建下拉选项。放在服务端而不是前端硬编码，
@@ -230,6 +276,19 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
       trustProxy: ctx.config.trustProxy,
       shareSourceAlert: ctx.config.shareSourceAlert,
       nodePingIntervalHours: ctx.config.nodePingIntervalHours,
+      // IX 中转的前端常量。`IX_AUTH_MODES satisfies …` 是与上面 PROXY_TYPES
+      // 同一手法的**反向**对齐：`Record<IxAuthMode, …>` 保证领域类型新增成员时
+      // 必须来这里加键，而这一行保证加了键就必须同步 zod 枚举。
+      ixAuthModes: (IX_AUTH_MODES satisfies readonly z.infer<typeof IxAuthModeSchema>[]).map((value) => ({
+        value,
+        label: IX_AUTH_MODE_LABELS[value],
+      })),
+      ixStates: IX_STATES.map((value) => ({ value, label: IX_STATE_LABELS[value] })),
+      ixSyncIntervalHours: ctx.config.ixSyncIntervalHours,
+      /** 连续多少轮同步没见到节点就标孤儿。界面上"第 N/M 轮"要显示 M。 */
+      ixOrphanThreshold: ctx.config.ixOrphanThreshold,
+      /** 一次批量建映射的指纹上限。前端用它做同一份预检，别再硬编码一份。 */
+      ixMaxFingerprints: IX_MAX_FINGERPRINTS,
     }));
 
     // ── 首屏聚合 ──────────────────────────────────────
@@ -351,6 +410,9 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
         fingerprint: node.fingerprint,
         type: node.type,
       });
+      // 与下面的两个二维码路由同属凭据出口，响应体等同凭据，不该进磁盘缓存。
+      // （这行以前漏了，而 CLAUDE.md 声称三个出口都带 —— 文档对、代码错。）
+      reply.header('cache-control', 'no-store');
       return { uri: emitUri(node) };
     });
 
@@ -487,6 +549,10 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
       return {
         stats: rendered.filterStats,
         chain: rendered.chain,
+        // 预览必须能解释"为什么这些节点还是直连" —— 少了这两个字段，
+        // 用户在预览里只会看到节点数没变，看不到 IX 那一趟发生了什么
+        ix: rendered.ix,
+        ixSkipped: rendered.ixSkipped,
         warnings: rendered.warnings,
         skipped: rendered.skipped,
         target: rendered.target,
@@ -505,6 +571,9 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
         bodyTruncated: rendered.body.length > 4000,
       };
     });
+
+    // ── IX 中转 ───────────────────────────────────────
+    // 九个 `/api/ix/*` 路由在 routes/ix.ts（同前缀的独立插件）。见本文件头注释。
 
     // ── 订阅 token ────────────────────────────────────
     app.get('/tokens', async () => {

@@ -12,6 +12,7 @@ import type { Logger } from '../logger.js';
 import type { SyncService } from './sync.js';
 import type { AccessLogRepo } from '../db/repo/sharing.js';
 import type { NodePingService } from './node-ping.js';
+import type { IxService } from './ix.js';
 
 export interface SchedulerOptions {
   /** 检查间隔（分钟）。0 表示禁用自动同步。 */
@@ -21,6 +22,10 @@ export interface SchedulerOptions {
   accessLog?: AccessLogRepo;
   accessLogRetentionDays?: number;
   nodePing?: NodePingService;
+  /** IX 中转编排。省略 = 不做 IX 状态同步。 */
+  ix?: IxService;
+  /** IX 状态同步间隔（小时）。0 或省略表示禁用。 */
+  ixSyncIntervalHours?: number;
 }
 
 export class Scheduler {
@@ -35,6 +40,7 @@ export class Scheduler {
   private running = false;
   private lastPruneAt = 0;
   private lastPingHistoryPruneAt = 0;
+  private lastIxSyncAt = 0;
 
   constructor(private readonly options: SchedulerOptions) {}
 
@@ -116,12 +122,52 @@ export class Scheduler {
           logger.info('自动节点 TCP 测试完成', result);
         }
       }
+
+      await this.tickIx();
     } catch (err) {
       logger.error('调度器执行出错', {
         error: err instanceof Error ? err.message : String(err),
       });
     } finally {
       this.running = false;
+    }
+  }
+
+  /**
+   * IX 中转状态同步：把远端端口的入口地址、延迟、流量、挂起状态对齐到本地映射。
+   *
+   * **自带 try/catch，且排在订阅同步与节点探测之后。**中转平台是外部服务，
+   * 它挂了、限流了、凭据过期了都不该影响 subagg 的主功能 ——
+   * 而这一层同步失败的唯一后果是"映射状态旧了一轮"，
+   * 渲染仍然照本地映射工作（不可用的映射会让节点回落直连）。
+   */
+  private async tickIx(): Promise<void> {
+    const { ix, logger } = this.options;
+    const hours = this.options.ixSyncIntervalHours ?? 0;
+    if (!ix || hours <= 0) return;
+    if (Date.now() - this.lastIxSyncAt < hours * 3600_000) return;
+
+    // 时间门在**发起前**推进：平台连续失败时不该变成每轮都重试的忙等
+    this.lastIxSyncAt = Date.now();
+    try {
+      const results = await ix.refreshAll();
+      for (const result of results) {
+        if (!result.ok) {
+          logger.warn('IX 状态同步失败', { providerRef: result.providerId?.slice(0, 8), reason: result.error });
+          continue;
+        }
+        if (result.checked === 0) continue;
+        logger.info('IX 状态同步完成', {
+          providerRef: result.providerId?.slice(0, 8),
+          checked: result.checked,
+          updated: result.updated,
+          missingRemote: result.missingRemote,
+          orphaned: result.orphaned,
+          recovered: result.recovered,
+        });
+      }
+    } catch (err) {
+      logger.warn('IX 状态同步出错', { error: err instanceof Error ? err.message : String(err) });
     }
   }
 }

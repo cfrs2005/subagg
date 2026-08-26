@@ -7,13 +7,16 @@
  */
 
 import type { Config } from './config.js';
+import { deriveKey } from './core/secret.js';
 import { openDatabase, type Db } from './db/index.js';
+import { IxMappingRepo, IxProviderRepo } from './db/repo/ix.js';
 import { NodeRepo } from './db/repo/nodes.js';
 import { PingHistoryRepo } from './db/repo/ping-history.js';
 import { ProfileRepo } from './db/repo/profiles.js';
 import { AccessLogRepo, FriendRepo, TokenRepo } from './db/repo/sharing.js';
 import { SubscriptionRepo, TrafficRepo } from './db/repo/subscriptions.js';
 import type { Logger } from './logger.js';
+import { IxService } from './services/ix.js';
 import { LimitStats } from './services/limit-stats.js';
 import { Scheduler } from './services/scheduler.js';
 import { NodePingService } from './services/node-ping.js';
@@ -32,9 +35,12 @@ export interface AppContext {
   tokens: TokenRepo;
   accessLog: AccessLogRepo;
   pingHistory: PingHistoryRepo;
+  ixProviders: IxProviderRepo;
+  ixMappings: IxMappingRepo;
 
   sync: SyncService;
   nodePing: NodePingService;
+  ix: IxService;
   scheduler: Scheduler;
   /** 限流命中计数。进程内，重启清零 —— 展示时必须带上 since。 */
   limitStats: LimitStats;
@@ -52,10 +58,26 @@ export function createContext(config: Config, logger: Logger): AppContext {
   const tokens = new TokenRepo(db);
   const accessLog = new AccessLogRepo(db);
   const pingHistory = new PingHistoryRepo(db);
+  const ixProviders = new IxProviderRepo(db);
+  const ixMappings = new IxMappingRepo(db);
 
   const limitStats = new LimitStats();
   const sync = new SyncService({ config, logger, subscriptions, nodes, traffic });
   const nodePing = new NodePingService({ config, logger, nodes, history: pingHistory });
+  // 凭据加密密钥在这里派生**一次**：scrypt 是刻意慢的，放进每次加解密就等于
+  // 给每个管理请求加上几十毫秒。core/secret.ts 收密钥当参数，正是为了让
+  // "密钥从哪来"留在装配层（core 零 IO，不读环境变量）。
+  // 代价写在文档里：轮换 ADMIN_TOKEN 后已存的 IX 凭据永久解不开，
+  // 届时 provider 会被标成"需重新录入"并回落直连，不会崩。
+  const secretKey = deriveKey(config.adminToken);
+  const ix = new IxService({
+    config,
+    logger,
+    providers: ixProviders,
+    mappings: ixMappings,
+    nodes,
+    secretKey,
+  });
   const scheduler = new Scheduler({
     intervalMinutes: config.schedulerIntervalMin,
     logger,
@@ -63,6 +85,8 @@ export function createContext(config: Config, logger: Logger): AppContext {
     accessLog,
     accessLogRetentionDays: config.accessLogRetentionDays,
     nodePing,
+    ix,
+    ixSyncIntervalHours: config.ixSyncIntervalHours,
   });
 
   return {
@@ -77,8 +101,11 @@ export function createContext(config: Config, logger: Logger): AppContext {
     tokens,
     accessLog,
     pingHistory,
+    ixProviders,
+    ixMappings,
     sync,
     nodePing,
+    ix,
     scheduler,
     limitStats,
   };

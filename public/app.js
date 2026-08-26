@@ -40,7 +40,10 @@ function fmtBytes(bytes) {
   if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(2)} GB`;
   if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
   if (bytes >= 1e3) return `${Math.round(bytes / 1e3)} KB`;
-  return `${bytes} B`;
+  // 其余分支都经过算术运算，结果必然是数字；只有这条会把入参原样带出去。
+  // 上游/中转平台返回的流量字段理论上可以是任意 JSON 值，所以这里也要转义 ——
+  // 本函数的返回值会被拼进 innerHTML。
+  return `${esc(bytes)} B`;
 }
 
 function fmtTime(ts) {
@@ -222,6 +225,13 @@ const state = {
 
   // 节点页的勾选（用于"从选中节点新建配置"）
   picked: new Set(),
+
+  // IX 中转。providers / mappings 各来自一个接口；ixError 记录整层不可用的原因
+  // （接口没上线、无权限等），此时界面要如实说"读不到"，而不是显示成"没有数据"。
+  ixProviders: [],
+  ixMappings: [],
+  ixWarnings: [],
+  ixError: null,
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -249,7 +259,33 @@ async function loadAll() {
   const currentPings = [...state.pingResults].filter(([fingerprint]) => currentFingerprints.has(fingerprint));
   state.pingResults = new Map([...persistedPings, ...currentPings]);
 
+  await loadIx();
   renderAll();
+}
+
+/**
+ * 读 IX 中转数据。
+ *
+ * **刻意不抛异常**：中转是可选功能，它的接口不可用（未部署、无权限）不该把
+ * 整个管理台拖挂。失败原因记进 `state.ixError` 并原样展示 —— 静默变成
+ * "什么都没有"会让人以为映射被清空了。
+ */
+async function loadIx() {
+  try {
+    const [providers, mappings] = await Promise.all([
+      api.get('/ix/providers'),
+      api.get('/ix/mappings'),
+    ]);
+    state.ixProviders = providers?.providers ?? [];
+    state.ixMappings = mappings?.mappings ?? [];
+    state.ixWarnings = mappings?.warnings ?? [];
+    state.ixError = null;
+  } catch (err) {
+    state.ixProviders = [];
+    state.ixMappings = [];
+    state.ixWarnings = [];
+    state.ixError = err instanceof Error ? err.message : String(err);
+  }
 }
 
 function renderAll() {
@@ -261,9 +297,11 @@ function renderAll() {
   renderTraffic();
   renderFriends();
   renderSettings();
+  renderIx();
 
   document.getElementById('profileCnt').textContent = state.profiles.length;
   document.getElementById('friendCnt').textContent = state.friends.length;
+  document.getElementById('ixCnt').textContent = state.ixMappings.length;
 
   const lastSync = state.subscriptions
     .map((s) => s.lastSyncAt)
@@ -350,6 +388,361 @@ function renderSettings() {
 }
 
 // ─────────────────────────────────────────────────────────────
+//  IX 中转页
+// ─────────────────────────────────────────────────────────────
+//
+// 三块内容：中转商卡片（凭据状态 / 权限 / 额度）、线路级端口配额条、
+// 节点映射表。全部只展示平台真实返回的字段 —— 没有任何"预计""估算"，
+// 与流量页同一条产品原则。
+
+/** `quota` 可能是对象也可能是 JSON 字符串（取决于后端序列化方式），两种都吃。 */
+function ixQuota(provider) {
+  const raw = provider?.quota;
+  if (!raw) return null;
+  if (typeof raw === 'string') {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+  return typeof raw === 'object' ? raw : null;
+}
+
+function ixQuotaLevel(pct) {
+  return pct >= 90 ? 'bad' : pct >= 70 ? 'warn' : 'ok';
+}
+
+/**
+ * 状态徽章的判定顺序有语义：孤儿 → 异常 → 已挂起 → 等待分配 → 正常。
+ * 孤儿最靠前是因为它需要人工决定（保留还是删远端端口）；
+ * "已挂起"排在"正常"之前，是为了不让一个平台侧停用的端口显示成可用。
+ */
+function ixStateBadge(mapping) {
+  if (mapping.state === 'orphan') return { cls: 's-orphan', label: '孤儿' };
+  if (mapping.state === 'error') return { cls: 's-error', label: '异常' };
+  if (mapping.suspended) return { cls: 's-suspended', label: '已挂起' };
+  if (mapping.state === 'pending') return { cls: 's-pending', label: '等待分配' };
+  return { cls: 's-active', label: '正常' };
+}
+
+/**
+ * 状态的长文案。**由 `/meta` 提供**（后端 `IX_STATE_LABELS` 用
+ * `Record<IxMappingState, …>` 锁住穷尽性），前端不再抄一份 ——
+ * 抄一份的结果是后端加了状态、界面上显示成空白。
+ */
+function ixStateHint(value) {
+  return state.meta?.ixStates?.find((item) => item.value === value)?.label ?? '';
+}
+
+function ixMappingIndex() {
+  return new Map(state.ixMappings.map((mapping) => [mapping.fingerprint, mapping]));
+}
+
+/**
+ * 端口级 UDP 能力的三态文案。
+ *
+ * `null`（未同步）**必须显示成「未知」而不是「否」**：这一列的全部价值就是把
+ * "平台明确说不转" 和 "我们还没问过" 分开。把未知渲染成事实，用户就会拿它
+ * 去排错 —— 而它可能恰好是反的，那比不显示更糟。
+ *
+ * 三条文案都写"后果 + 下一步"，与 core/ix.ts 里 `DETAIL_UDP_*` 同一口吻：
+ * 只讲原因不给出路的诊断信息，用户读完还是只能干等。
+ */
+const IX_UDP_HINTS = {
+  on: '该中转端口转发 UDP：hysteria2 / tuic / QUIC 传输的节点可以走中转，TCP 系节点自身的 UDP 能力原样保留。',
+  off:
+    '该中转端口不转发 UDP。后果分两种：hysteria2 / tuic / QUIC 传输的节点协议本体就跑在 UDP 上，' +
+    '改写后是必然连不上的死节点，所以渲染时会拒绝改写、让它保持直连；' +
+    'ss / ssr / vmess / vless / trojan 这类 TCP 系节点照常改写，但自身的 udp 会被如实降级为 false，' +
+    '避免客户端把 UDP 流量送进黑洞。下一步：在中转平台给这个端口开启 UDP 转发，再回来同步一次。',
+  unknown:
+    '还没同步过这个端口的 UDP 转发能力（新建映射、或刚升级完都会是这样），所以显示「未知」而不是「否」—— ' +
+    '这里不拿猜测当事实。当前按宽松处理：照常改写，并在预览与响应头里附一条「UDP 转发能力未知」的警告。' +
+    '下一步：点「同步映射状态」拉一次平台的真实值，这一格会自愈成「转发」或「不转发」。',
+};
+
+/**
+ * 三态 → 徽章。`undefined`（后端还没带出这个字段）与 `null` 同等对待：
+ * 都是"事实未知"，不能悄悄退化成"否"。
+ */
+function ixUdpBadge(entryUdp) {
+  if (entryUdp === true) return { cls: 'u-on', label: '转发', hint: IX_UDP_HINTS.on };
+  if (entryUdp === false) return { cls: 'u-off', label: '不转发', hint: IX_UDP_HINTS.off };
+  return { cls: 'u-unknown', label: '未知', hint: IX_UDP_HINTS.unknown };
+}
+
+/** 映射表的 UDP 单元格。未知态额外挂一行可操作的下一步（与孤儿行的副标题同一套写法）。 */
+function ixUdpCellHtml(mapping) {
+  const badge = ixUdpBadge(mapping.entryUdp);
+  const unknown = mapping.entryUdp !== true && mapping.entryUdp !== false;
+  return `
+    <span class="ix-udp ${badge.cls}" title="${esc(badge.hint)}"><i></i>${badge.label}</span>
+    ${unknown ? '<span class="ix-row-fp">点「同步映射状态」拉真实值</span>' : ''}`;
+}
+
+/**
+ * 协议本体是否跑在 UDP 上 —— 这类节点在不转 UDP 的入口后面是彻底死的
+ * （core/ix.ts 的 `runsOverUdp`）。
+ *
+ * 前端只能看 `type`：`/api/nodes` 不返回 transport，所以后端那条
+ * `transport.network === 'quic'` 的分支在这里判不出来。宁可漏报一个提示，
+ * 也不误报 —— 把一个好节点标成死的，比不标更容易把人带偏。
+ */
+function nodeRunsOverUdp(node) {
+  return node?.type === 'hysteria2' || node?.type === 'tuic';
+}
+
+/** 微秒 → 毫秒。平台的原始口径是微秒，直接显示会让人误读成毫秒。 */
+function ixLatencyText(latencyUs) {
+  if (latencyUs === null || latencyUs === undefined) return '—';
+  return `${(latencyUs / 1000).toFixed(1)} ms`;
+}
+
+/**
+ * 丢包率。平台字段叫 `packet_loss_rate`，按惯例是 0-1 的比例，
+ * 但没有文档保证 —— 所以百分比旁边把**平台原始值**放进 title，
+ * 万一口径不同用户能自己看出来，而不是被一个我们猜出来的数字误导。
+ */
+function ixLossText(lossRate) {
+  if (lossRate === null || lossRate === undefined) return '—';
+  return `<span title="平台原始值 packet_loss_rate=${esc(lossRate)}">${(lossRate * 100).toFixed(1)}%</span>`;
+}
+
+function ixProviderName(providerId) {
+  return state.ixProviders.find((provider) => provider.id === providerId)?.name ?? providerId;
+}
+
+function ixLineRowsHtml(quota, provider) {
+  const lines = Array.isArray(quota?.lines) ? quota.lines : [];
+  if (!lines.length) {
+    return `<div class="pe-empty">还没有测试过连接，线路与端口配额未知。点下方「测试连接」拉一次。</div>`;
+  }
+  return lines
+    .map((line) => {
+      const max = typeof line.maxPorts === 'number' ? line.maxPorts : null;
+      const used = typeof line.usedPorts === 'number' ? line.usedPorts : null;
+      const pct = max && used !== null ? Math.min(100, (used / max) * 100) : 0;
+      const level = ixQuotaLevel(pct);
+      const isDefault = provider.defaultLineId !== null && provider.defaultLineId === line.lineId;
+      const notes = [];
+      if (line.suspended) notes.push('该线路已被平台挂起，新建端口会失败。');
+      if (line.online === false) notes.push('该线路当前离线。');
+      return `
+        <div class="ix-line">
+          <div class="ix-line-head">
+            <b>${esc(line.name ?? `线路 ${line.lineId}`)}</b>
+            ${isDefault ? '<span class="ix-line-tag">默认</span>' : ''}
+            <span class="ix-line-entry">${esc(line.entryHost ?? '入口未知')}</span>
+            <span>端口段 ${esc(line.portStart ?? '?')}-${esc(line.portEnd ?? '?')}</span>
+            <span class="ix-quota q-${level}">已用 ${used === null ? '?' : esc(used)}/${max === null ? '?' : esc(max)} 端口</span>
+          </div>
+          <div class="pbar"><div class="pfill f-${level}" style="width:${pct.toFixed(1)}%"></div></div>
+          ${notes.length ? `<div class="ix-line-note">${notes.map((note) => esc(note)).join(' ')}</div>` : ''}
+        </div>`;
+    })
+    .join('');
+}
+
+function ixProviderCardHtml(provider) {
+  const quota = ixQuota(provider);
+  const probeState = provider.credentialBroken
+    ? { cls: 'offline', label: '凭据不可用' }
+    : provider.lastError
+      ? { cls: 'offline', label: '连接失败' }
+      : provider.lastProbeAt
+        ? { cls: 'online', label: '已连接' }
+        : { cls: 'unknown', label: '未测试' };
+  const used = quota?.trafficUsedBytes;
+  const total = quota?.trafficTotalBytes;
+  const unavailable = Array.isArray(quota?.unavailable) ? quota.unavailable : [];
+  const mappingCount = provider.mappingCount ?? state.ixMappings.filter((m) => m.providerId === provider.id).length;
+
+  return `
+    <section class="settings-card ix-provider-card">
+      <div class="settings-card-head">
+        <div>
+          <div class="settings-kicker">IX PROVIDER</div>
+          <h2>${esc(provider.name)}</h2>
+          <p class="ix-provider-url">${esc(provider.baseUrl)}</p>
+        </div>
+        <span class="status-pill ${probeState.cls}"><i></i>${probeState.label}</span>
+      </div>
+
+      ${
+        // 凭据坏了和 lastError 里那条解密报错说的是同一件事，只显示一条。
+        // 曾经两条并排 + 一条讲原理，同一件事说三遍，反而没人看得懂要做什么。
+        provider.credentialBroken
+          ? `<div class="err-box"><strong>读不出保存的账号密码</strong>，这个中转商暂时不工作，
+               相关节点会照原样直连。点下面的「编辑」重新填一次账号密码就恢复了。
+               <span class="ix-row-fp">起因：密码是用 ADMIN_TOKEN 加密存的，换过 ADMIN_TOKEN 就解不开旧密码了。</span></div>`
+          : provider.lastError
+            ? `<div class="err-box">⚠ 上次调用失败：${esc(provider.lastError)}</div>`
+            : ''
+      }
+      ${
+        provider.enabled === false
+          ? `<div class="warn-box"><strong>全局总闸已关闭</strong>：所有 profile 的中转改写一起停用，订阅立刻回全部直连。映射数据保留，重新打开即恢复。</div>`
+          : ''
+      }
+      ${
+        unavailable.length
+          ? `<div class="warn-box"><strong>该账号不可用的能力</strong>
+               <ul class="ix-unavail">${unavailable.map((item) => `<li>${esc(item)}</li>`).join('')}</ul></div>`
+          : ''
+      }
+
+      <div class="ix-switch-row">
+        <label class="pe-switch">
+          <input type="checkbox" data-action="ix-toggle-enabled" data-id="${esc(provider.id)}" ${provider.enabled ? 'checked' : ''}>
+          <span></span><b>全局总闸${provider.enabled ? '：已启用' : '：已关闭'}</b>
+        </label>
+        <label class="pe-switch">
+          <input type="checkbox" data-action="ix-toggle-udp" data-id="${esc(provider.id)}" ${provider.enableUdp ? 'checked' : ''}>
+          <span></span><b>UDP 转发${provider.enableUdp ? '：已开启' : '：未开启'}</b>
+        </label>
+      </div>
+
+      <dl class="settings-list">
+        <dt>认证方式</dt><dd>${provider.authMode === 'api-key' ? 'API Key' : '账号登录'}</dd>
+        <dt>平台账号</dt><dd>${esc(provider.username || quota?.username || '—')}</dd>
+        <dt>凭据</dt><dd>${provider.hasCredentials ? '已保存 ●●●●●●' : '未录入'}</dd>
+        <dt>默认线路</dt><dd>${provider.defaultLineId === null || provider.defaultLineId === undefined ? '自动' : esc(provider.defaultLineId)}</dd>
+        <dt>流量</dt><dd>${fmtBytes(used)}${total ? ` / ${fmtBytes(total)}` : ''}</dd>
+        <dt>到期</dt><dd>${quota?.validUntil ? `${esc(quota.validUntil)}${quota.expired ? '（已过期）' : ''}` : '—'}</dd>
+        <dt>上次测试</dt><dd>${fmtTime(provider.lastProbeAt)}</dd>
+        <dt>本地映射</dt><dd>${esc(mappingCount)} 条</dd>
+      </dl>
+
+      <div class="ix-section-title">权限与线路</div>
+      ${ixLineRowsHtml(quota, provider)}
+      <div class="field-hint">端口配额是<strong>线路级</strong>的，账户顶层没有这个上限。多条线路各自独立计算。</div>
+
+      <div class="ix-card-actions">
+        <button class="btn-sec" data-action="ix-probe" data-id="${esc(provider.id)}">⚡ 测试连接</button>
+        <button class="btn-sec" data-action="ix-edit-provider" data-id="${esc(provider.id)}">✎ 编辑</button>
+        <button class="btn-sec" data-action="ix-refresh" data-id="${esc(provider.id)}">↻ 同步映射状态</button>
+        <div class="spacer"></div>
+        <button class="btn-danger" data-action="ix-delete-provider" data-id="${esc(provider.id)}">删除</button>
+      </div>
+    </section>`;
+}
+
+function ixMappingRowsHtml() {
+  const nodesByFp = new Map(state.nodes.map((node) => [node.fingerprint, node]));
+  const showProvider = state.ixProviders.length > 1;
+  return state.ixMappings
+    .map((mapping) => {
+      const badge = ixStateBadge(mapping);
+      const node = nodesByFp.get(mapping.fingerprint);
+      // nodeName 由后端带出；节点已从订阅里消失时退回指纹前 8 位（与日志的
+      // tokenRef 同口径，可以直接拿去 WHERE fingerprint LIKE 'xxx%'）
+      const name = mapping.nodeName || node?.name || `${mapping.fingerprint.slice(0, 8)}…`;
+      const errors = [mapping.syncError, mapping.lastError].filter(Boolean);
+      const entry = mapping.entryHost && mapping.entryPort
+        ? `${esc(mapping.entryHost)}:${esc(mapping.entryPort)}`
+        : '<span class="ix-cell-none">待分配</span>';
+      const isOrphan = mapping.state === 'orphan';
+      return `
+        <tr class="${isOrphan ? 'is-orphan' : ''}">
+          <td>
+            <span class="ix-row-name">${esc(name)}</span>
+            <span class="ix-row-fp">${esc(mapping.fingerprint)}</span>
+          </td>
+          <td class="ix-mono">${esc(mapping.targetHost)}:${esc(mapping.targetPort)}</td>
+          <td class="ix-mono">${entry}</td>
+          <td class="ix-udp-cell">${ixUdpCellHtml(mapping)}</td>
+          <td>
+            ${esc(mapping.lineName || (mapping.lineId === null || mapping.lineId === undefined ? '—' : `线路 ${mapping.lineId}`))}
+            ${showProvider ? `<span class="ix-row-fp">${esc(ixProviderName(mapping.providerId))}</span>` : ''}
+          </td>
+          <td>
+            <span class="ix-state ${badge.cls}" title="${esc(ixStateHint(mapping.state))}"><i></i>${badge.label}</span>
+            ${isOrphan ? `<span class="ix-row-fp">连续 ${esc(mapping.missingCount ?? 0)}/${esc(state.meta?.ixOrphanThreshold ?? '?')} 轮没在节点里找到</span>` : ''}
+            ${errors.length ? `<div class="ix-row-err" title="${esc(errors.join(' / '))}">${errors.map((text) => esc(text)).join('<br>')}</div>` : ''}
+          </td>
+          <td class="ix-mono" title="中转入口 → 原落地这一段，不是端到端">${ixLatencyText(mapping.latencyUs)}</td>
+          <td class="ix-mono">${ixLossText(mapping.lossRate)}</td>
+          <td class="ix-traffic">↑ ${fmtBytes(mapping.trafficOut)}<br>↓ ${fmtBytes(mapping.trafficIn)}</td>
+          <td class="ix-row-actions">
+            ${
+              isOrphan
+                ? `<button class="icobtn" data-action="ix-keep-orphan" data-fp="${esc(mapping.fingerprint)}">保留</button>`
+                : ''
+            }
+            <button class="icobtn" data-action="ix-unlink" data-fp="${esc(mapping.fingerprint)}" data-id="${esc(mapping.providerId)}">解除</button>
+            <button class="icobtn danger" data-action="ix-delete-remote" data-fp="${esc(mapping.fingerprint)}" data-id="${esc(mapping.providerId)}">删除远端端口</button>
+          </td>
+        </tr>`;
+    })
+    .join('');
+}
+
+function renderIx() {
+  const body = document.getElementById('ixBody');
+  if (!body) return;
+
+  const errorBox = state.ixError
+    ? `<div class="err-box"><strong>读不到中转数据</strong>：${esc(state.ixError)}。下面显示的是空列表，不代表映射已被清空。</div>`
+    : '';
+  const warnings = state.ixWarnings.length
+    ? `<div class="warn-box"><strong>需要注意</strong><ul class="ix-unavail">${state.ixWarnings.map((warning) => `<li>${esc(warning)}</li>`).join('')}</ul></div>`
+    : '';
+
+  const providers = state.ixProviders.length
+    ? `<div class="ix-provider-grid">${state.ixProviders.map((provider) => ixProviderCardHtml(provider)).join('')}</div>`
+    : `<section class="settings-card"><div class="empty">
+         还没有配置中转商<br>
+         <b>中转商 = 一个 L4 端口转发平台的账号</b><br>
+         录入后先「测试连接」拿到线路与端口配额，再到节点页勾选要走中转的节点
+       </div></section>`;
+
+  const mappings = state.ixMappings.length
+    ? `<div class="table-scroll"><table class="ntable ix-table">
+         <thead><tr><th>节点</th><th>原目标</th><th>中转入口</th><th title="这个中转端口转不转 UDP。决定 hysteria2 / tuic / QUIC 节点能否走中转">UDP</th><th>线路</th><th>状态</th><th>延迟（中转段）</th><th>丢包</th><th>流量</th><th>操作</th></tr></thead>
+         <tbody>${ixMappingRowsHtml()}</tbody>
+       </table></div>`
+    : `<div class="empty">还没有任何映射<br><b>到节点页勾选节点，再点「建立 IX 转发」</b></div>`;
+
+  const orphanCount = state.ixMappings.filter((mapping) => mapping.state === 'orphan').length;
+
+  // 未知不是错误，但它是**唯一一格靠一次同步就能自愈**的未知 —— 所以在表头
+  // 上方给一个带按钮的提示，而不是让用户逐行去悟那句「点同步」。
+  const udpUnknownCount = state.ixMappings.filter(
+    (mapping) => mapping.entryUdp !== true && mapping.entryUdp !== false,
+  ).length;
+  const udpNote = udpUnknownCount
+    ? `<div class="warn-box ix-udp-note">
+         <strong>${udpUnknownCount} 条映射的 UDP 转发能力未知</strong>：这些端口还没同步过，
+         所以 UDP 那一列显示「未知」而不是「否」—— 不拿猜测当事实。
+         未知按宽松处理（照常改写 + 一条警告），但 hysteria2 / tuic 这类节点到底能不能用，要看真实值。
+         <button class="btn-sec" data-action="ix-refresh">↻ 同步映射状态</button>
+       </div>`
+    : '';
+
+  body.innerHTML = `
+    ${errorBox}
+    ${warnings}
+    ${providers}
+    <section class="ix-map-card">
+      <div class="ix-card-head">
+        <div>
+          <div class="settings-kicker">MAPPINGS</div>
+          <h2>节点映射</h2>
+          <p>一条映射 = 平台上一个转发端口。改写只发生在生成订阅时，节点在库里始终是原始地址。</p>
+        </div>
+        <span class="ix-count-pill">${state.ixMappings.length} 条${orphanCount ? ` · 孤儿 ${orphanCount}` : ''}</span>
+      </div>
+      <div class="warn-box ix-latency-note">
+        <strong>两个延迟不要相加</strong>：本表的延迟由中转平台探测，量的是「中转入口 → 原落地」那一段；
+        节点页上的延迟是本机直连原落地。两者含义不同，相加也不等于端到端延迟，所以这里不做任何推导。
+      </div>
+      ${udpNote}
+      ${mappings}
+    </section>`;
+}
+
+// ─────────────────────────────────────────────────────────────
 //  节点页
 // ─────────────────────────────────────────────────────────────
 
@@ -429,7 +822,7 @@ function renderNodes(nodes) {
   if (!body) return;
 
   if (state.nodes.length === 0) {
-    body.innerHTML = `<tr><td colspan="10"><div class="empty">
+    body.innerHTML = `<tr><td colspan="11"><div class="empty">
       还没有任何节点<br><b>先在左侧添加一个订阅源</b>
     </div></td></tr>`;
     renderNodePagination(0);
@@ -437,7 +830,7 @@ function renderNodes(nodes) {
   }
 
   if (nodes.length === 0) {
-    body.innerHTML = `<tr><td colspan="10"><div class="empty">没有匹配的节点</div></td></tr>`;
+    body.innerHTML = `<tr><td colspan="11"><div class="empty">没有匹配的节点</div></td></tr>`;
     renderNodePagination(0);
     return;
   }
@@ -462,11 +855,34 @@ function renderNodes(nodes) {
   state.nodePage = Math.min(Math.max(1, state.nodePage), pageCount);
   const pageStart = (state.nodePage - 1) * state.nodePageSize;
   const pageNodes = sortedNodes.slice(pageStart, pageStart + state.nodePageSize);
+  const ixByFingerprint = ixMappingIndex();
   const rows = pageNodes.map((node) => {
     const ping = state.pingResults.get(node.fingerprint);
     const status = ping ? ping.ok ? 'online' : 'offline' : 'unknown';
     const statusLabel = status === 'online' ? '在线' : status === 'offline' ? '离线' : '未测试';
     const latency = ping?.ok ? `${ping.latencyMs ?? 0}ms` : '—';
+    const mapping = ixByFingerprint.get(node.fingerprint);
+    const ixCell = mapping
+      ? (() => {
+          const badge = ixStateBadge(mapping);
+          const port = mapping.entryPort ?? null;
+          const title = mapping.entryHost && port
+            ? `中转入口 ${mapping.entryHost}:${port}（延迟为中转入口→原落地那一段，与本行的直连延迟不是一回事）`
+            : '端口尚未由平台分配';
+          // 映射状态是"正常"、节点却根本不会走中转 —— 只显示状态徽章会让人以为
+          // 中转生效了。这一格是用户排查"我的 hy2 节点为什么没走中转"的第一落点，
+          // 所以把这条拒绝理由直接摆在这里，而不是只留在响应头与预览警告里。
+          const udpDead = nodeRunsOverUdp(node) && mapping.entryUdp === false;
+          const udpTitle =
+            `该中转端口不转发 UDP，而 ${node.type} 的协议本体跑在 UDP 上 —— ` +
+            '改写后是必然连不上的死节点（TCP 通、UDP 黑洞，最难归因的「半坏」），' +
+            '所以生成订阅时会拒绝改写，此节点保持直连。' +
+            '下一步：在中转平台给这个端口开启 UDP 转发后到 IX 页点「同步状态」，或让这类节点就保持直连。';
+          return `<span class="ix-badge ${badge.cls}" title="${esc(title)}">${badge.label}${port ? ` · ${esc(port)}` : ''}</span>${
+            udpDead ? `<span class="ix-badge u-off" title="${esc(udpTitle)}">不转 UDP · 直连</span>` : ''
+          }`;
+        })()
+      : '<span class="ix-cell-none">—</span>';
     return `<tr class="${state.selectedNodeFp === node.fingerprint ? 'selected' : ''}" data-action="select-node" data-fp="${esc(node.fingerprint)}">
       <td class="pick-cell"><input type="checkbox" data-action="pick-node" data-fp="${esc(node.fingerprint)}" ${state.picked.has(node.fingerprint) ? 'checked' : ''}></td>
       <td><span class="nname">${regionFlag(node.region)} ${esc(node.name)}</span><small class="node-fingerprint">${esc(node.fingerprint)}</small></td>
@@ -477,16 +893,18 @@ function renderNodes(nodes) {
       <td class="latency-cell ${status === 'online' ? 'is-online' : ''}">${latency}</td>
       <td><span class="status-pill ${status}"><i></i>${statusLabel}</span></td>
       <td class="nsrc">${esc(node.sourceName)}</td>
+      <td>${ixCell}</td>
       <td class="row-actions"><button class="icon-action" data-action="ping-node" data-fp="${esc(node.fingerprint)}" title="测试 TCP 连通性">ϟ</button><button class="icon-action" data-action="copy-node" data-fp="${esc(node.fingerprint)}" title="复制 URI">↗</button><button class="icon-action" data-action="select-node" data-fp="${esc(node.fingerprint)}" title="查看详情">⋮</button></td>
     </tr>`;
   }).join('');
 
   // 勾选了节点时，在表格顶部插一条操作栏 —— 这是"生成选择"的入口
   const actionBar = state.picked.size
-    ? `<tr><td colspan="10" style="background:var(--adim)">
+    ? `<tr><td colspan="11" style="background:var(--adim)">
         <div style="display:flex;align-items:center;gap:10px">
           <span>已勾选 <b>${state.picked.size}</b> 个节点</span>
           <button class="mini-btn" data-action="profile-from-picked">用它们新建配置文件</button>
+          <button class="mini-btn" data-action="ix-map-picked">建立 IX 转发</button>
           <button class="mini-btn" data-action="clear-picked">清空勾选</button>
         </div>
       </td></tr>`
@@ -665,6 +1083,7 @@ function ruleTags(rule) {
     const l = rule.chain.landing?.pick?.length ?? 0;
     tags.push(`链式 ${e}×${l}`);
   }
+  if (rule.ix?.enabled) tags.push('IX 中转');
   if (tags.length === 0) tags.push('全部节点');
   return tags;
 }
@@ -1413,6 +1832,76 @@ function refreshChainPicker(restoreSearchFocus = false) {
   }
 }
 
+/**
+ * profile 级的 IX 中转面板。
+ *
+ * 两个概念要分清：这里的开关是 **per-profile** 的（这条订阅要不要走中转），
+ * 中转商卡片上的「全局总闸」是 **全局** 的（故障时一键让所有 profile 回直连）。
+ * 总闸关着的时候这里开了也不生效，所以要当场说明白。
+ */
+function ixProfilePanelHtml() {
+  const ix = editingProfile.rule.ix ?? {};
+  const enabled = ix.enabled === true;
+  const fill = ix.fillOriginHost !== false;
+  const providers = state.ixProviders;
+  const masterOff = providers.length > 0 && providers.every((provider) => provider.enabled === false);
+
+  return `
+    <section class="pe-card pe-ix-card">
+      <div class="pe-card-head">
+        <div>
+          <div class="pe-kicker">OPTIONAL RELAY</div>
+          <h2>IX 中转</h2>
+          <p>把命中节点的入口地址换成中转入口，协议参数与凭据一字不动。改写只发生在生成订阅时，不写库。</p>
+        </div>
+        <label class="pe-switch">
+          <input type="checkbox" id="p-ix-enabled" ${enabled ? 'checked' : ''}>
+          <span></span><b>${enabled ? '已启用' : '未启用'}</b>
+        </label>
+      </div>
+      ${
+        providers.length
+          ? ''
+          : `<div class="warn-box">还没有配置中转商。到「IX 中转」页录入一个并测试连接之后，这里才会生效。</div>`
+      }
+      ${
+        masterOff
+          ? `<div class="warn-box">所有中转商的<strong>全局总闸</strong>都是关闭状态，这里开了也不会生效。</div>`
+          : ''
+      }
+      <div class="pe-ix-grid">
+        <label class="field">
+          <span class="field-label">中转商</span>
+          <select class="select" id="p-ix-provider">
+            <option value=""${ix.providerId ? '' : ' selected'}>自动选择</option>
+            ${providers
+              .map(
+                (provider) =>
+                  `<option value="${esc(provider.id)}"${ix.providerId === provider.id ? ' selected' : ''}>${esc(provider.name)}${provider.enabled === false ? '（总闸关闭）' : ''}</option>`,
+              )
+              .join('')}
+          </select>
+          <small>只有一个中转商时选「自动」即可。</small>
+        </label>
+        <div class="field">
+          <span class="field-label">原始 SNI / Host 补写</span>
+          <label class="checkbox-row" style="margin-top:8px">
+            <input type="checkbox" id="p-ix-fill" ${fill ? 'checked' : ''}>
+            自动把原 server 补进 SNI / ws-Host / h2-host / http-Host（推荐保持开启）
+          </label>
+          <div class="err-box ix-fill-warn" id="p-ix-fill-warn" ${fill ? 'hidden' : ''}>
+            关掉之后这 4 个值会回落到中转入口域名，<strong>TLS 类节点基本必然握手失败</strong>，
+            而且失败原因对用户完全不可见。只在明确知道后果时当逃生阀用。
+          </div>
+        </div>
+      </div>
+      <div class="field-hint">
+        当前共有 <b>${state.ixMappings.length}</b> 条节点映射；没有映射的节点会<strong>如实回落直连</strong>并在响应头与预览里给出原因。
+        REALITY 缺 SNI、ss 带插件混淆这类判不准的组合会被保守拒绝改写 —— 保持直连，不静默改坏。
+      </div>
+    </section>`;
+}
+
 let profileNodePickerQuery = '';
 
 function profileNodePickerHtml() {
@@ -1484,12 +1973,29 @@ function renderProductProfilePage() {
           <section class="pe-card"><div class="pe-card-head"><div><div class="pe-kicker">01 · SELECT</div><h2>节点筛选</h2><p>先缩小候选范围，再决定是否添加链式节点。</p></div><span class="pe-count-pill">${state.nodes.length} 个可用节点</span></div><div class="pe-filter-grid"><div class="pe-filter-block"><span class="field-label">地区</span><div class="chip-group" id="p-regions">${regions.map((reg) => `<button class="chip${r.regions?.includes(reg.code) ? ' on' : ''}" data-action="rule-region" data-value="${esc(reg.code)}">${reg.flag} ${esc(reg.name)}</button>`).join('') || '<span class="pe-empty">暂无地区数据</span>'}</div></div><div class="pe-filter-block"><span class="field-label">协议</span><div class="chip-group" id="p-types">${types.map((type) => `<button class="chip${r.types?.includes(type) ? ' on' : ''}" data-action="rule-type" data-value="${esc(type)}">${esc(type.toUpperCase())}</button>`).join('') || '<span class="pe-empty">暂无协议数据</span>'}</div></div></div></section>
           ${profileNodePickerHtml()}
           ${chainPickerHtml()}
+          ${ixProfilePanelHtml()}
           <section class="pe-card"><div class="pe-card-head"><div><div class="pe-kicker">02 · REFINE</div><h2>高级筛选</h2><p>常用场景不需要打开这里。需要时再添加包含或排除条件。</p></div></div><div class="pe-advanced-grid"><div><div class="pe-subhead">包含条件</div><div id="p-include">${exprRows(r.include, 'include')}</div><button class="mini-btn" data-action="add-expr" data-kind="include">+ 添加包含条件</button></div><div><div class="pe-subhead">排除条件</div><div id="p-exclude">${exprRows(r.exclude, 'exclude')}</div><button class="mini-btn" data-action="add-expr" data-kind="exclude">+ 添加排除条件</button></div></div></section>
         </main>
         <aside class="pe-inspector"><div class="pe-inspector-head"><div class="pe-kicker">CONFIGURATION</div><h2>输出设置</h2><p>普通订阅与链式订阅使用同一个配置文件。</p></div><div class="pe-inspector-section"><span class="field-label">默认客户端</span><select class="select" id="p-target">${targets.map((target) => `<option value="${esc(target.value)}"${profile.defaultTarget === target.value ? ' selected' : ''}>${esc(target.label)}</option>`).join('')}</select><small>客户端带有明确 User-Agent 时会自动选择对应格式。</small></div><div class="pe-inspector-section"><span class="field-label">去重方式</span><select class="select" id="p-dedupe"><option value="off"${r.dedupe === 'off' ? ' selected' : ''}>不去重</option><option value="server-port"${r.dedupe === 'server-port' ? ' selected' : ''}>服务器 + 端口</option><option value="fingerprint"${r.dedupe === 'fingerprint' ? ' selected' : ''}>完整指纹</option></select><span class="field-label pe-label-gap">排序</span><select class="select" id="p-sort">${[['none','保持原顺序'],['region','按地区'],['name','按名称'],['type','按协议'],['source','按订阅源']].map(([value,label]) => `<option value="${value}"${r.sort === value ? ' selected' : ''}>${label}</option>`).join('')}</select></div><div class="pe-inspector-section"><span class="field-label">节点数量上限</span><input class="input" id="p-limit" type="number" min="0" max="5000" value="${r.limit ?? 0}"><small>0 表示不限制。链式配对会在此筛选之后生成。</small></div><div class="pe-inspector-section"><span class="field-label">重命名模板</span><input class="input" id="p-rename" value="${esc(r.rename?.[0]?.replace ?? '')}" placeholder="{flag} {regionZh} {index2}"><small>留空保持原名。</small></div><div class="pe-inspector-section"><span class="field-label">流量信息</span><select class="select" id="p-userinfo"><option value="sum"${profile.userinfoMode === 'sum' ? ' selected' : ''}>合计所有订阅源</option><option value="off"${profile.userinfoMode === 'off' ? ' selected' : ''}>不输出</option>${state.subscriptions.map((sub) => `<option value="follow:${esc(sub.id)}"${profile.userinfoMode === `follow:${sub.id}` ? ' selected' : ''}>跟随「${esc(sub.name)}」</option>`).join('')}</select></div><label class="checkbox-row pe-exclude-toggle"><input type="checkbox" id="p-defexc" ${r.useDefaultExclude !== false ? 'checked' : ''}>过滤机场信息节点</label>${r.pick?.length ? `<div class="pe-selected-note">已固定选择 ${r.pick.length} 个节点<button class="mini-btn" data-action="clear-rule-pick">清除</button></div>` : ''}</aside>
       </div>
     </div>`;
   activateProfileEditorPage();
+}
+
+/**
+ * 从表单读出 profile 级的 IX 配置。两个 collect 函数共用一份，
+ * 免得字段在其中一处漏掉 —— 那种漏法的症状是"界面上开了，订阅里没生效"。
+ * 面板不存在时返回 null（旧的 modal 版编辑器里没有这些控件）。
+ */
+function collectIxRule() {
+  if (!document.getElementById('p-ix-enabled')?.checked) return null;
+  const rule = {
+    enabled: true,
+    fillOriginHost: document.getElementById('p-ix-fill')?.checked !== false,
+  };
+  const providerId = document.getElementById('p-ix-provider')?.value;
+  if (providerId) rule.providerId = providerId;
+  return rule;
 }
 
 /** 把表单当前状态收集成一份 FilterRule。 */
@@ -1543,6 +2049,9 @@ function collectRule() {
     };
   }
 
+  const ix = collectIxRule();
+  if (ix) rule.ix = ix;
+
   return rule;
 }
 
@@ -1588,6 +2097,8 @@ function collectProductRule() {
       maxPairs: Math.min(1000, Math.max(1, Number(document.getElementById('p-chain-max').value) || 200)),
     };
   }
+  const ix = collectIxRule();
+  if (ix) rule.ix = ix;
   return rule;
 }
 
@@ -1829,6 +2340,284 @@ async function accessModal(friendId, tokenId = null) {
       <button class="btn-sec" data-action="close-modal">关闭</button>
     </div>
   `, true);
+}
+
+// ── IX 中转：表单、确认与结果 ──────────────────────────
+//
+// 这里所有的二次确认都走项目自己的 #overlay > #modal，**不用 `confirm()`**：
+// 浏览器原生 modal 会阻塞扩展事件，而"删除远端端口"是不可逆的外发操作，
+// 恰恰是最需要用户看清文案再点的那一类。
+
+/** 重新拉一遍 IX 数据并刷新受影响的三处界面（IX 页、节点表的中转列、侧栏计数）。 */
+async function reloadIx() {
+  await loadIx();
+  renderIx();
+  applyFilter();
+  const counter = document.getElementById('ixCnt');
+  if (counter) counter.textContent = state.ixMappings.length;
+}
+
+function ixProviderModal(provider) {
+  const editing = Boolean(provider);
+  const authMode = provider?.authMode ?? 'login';
+  const hasCredentials = Boolean(provider?.hasCredentials);
+  openModal(`
+    <div class="modal-title">${editing ? '编辑中转商' : '添加中转商'}</div>
+    <div class="modal-sub">凭据加密后落库（密钥由 <code>ADMIN_TOKEN</code> 派生）。轮换 <code>ADMIN_TOKEN</code> 后需要重新录入。</div>
+
+    <div class="field-row">
+      <div class="field"><label class="field-label">名称</label>
+        <input class="input" id="ix-name" value="${esc(provider?.name ?? '')}" placeholder="例如：zf 转发"></div>
+      <div class="field"><label class="field-label">认证方式</label>
+        <select class="select" id="ix-auth">
+          ${(state.meta?.ixAuthModes ?? [{ value: 'login', label: '账号密码登录' }, { value: 'api-key', label: 'API Key' }])
+            .map((mode) => `<option value="${esc(mode.value)}"${authMode === mode.value ? ' selected' : ''}>${esc(mode.label)}</option>`)
+            .join('')}
+        </select>
+      </div>
+    </div>
+
+    <div class="field"><label class="field-label">API 地址</label>
+      <input class="input" id="ix-base" value="${esc(provider?.baseUrl ?? '')}" placeholder="https://example.com/api">
+      <div class="field-hint">填到 <code>/api</code> 这一层，不带末尾斜杠。</div>
+    </div>
+
+    <div class="ix-auth-group" id="ix-group-login" ${authMode === 'api-key' ? 'hidden' : ''}>
+      <div class="field-row">
+        <div class="field"><label class="field-label">账号</label>
+          <input class="input" id="ix-user" value="${esc(provider?.username ?? '')}" autocomplete="off"></div>
+        <div class="field"><label class="field-label">密码</label>
+          <input class="input" id="ix-pass" type="password" autocomplete="new-password"
+                 placeholder="${hasCredentials ? '已保存，留空表示不修改' : ''}"></div>
+      </div>
+    </div>
+
+    <div class="ix-auth-group" id="ix-group-key" ${authMode === 'api-key' ? '' : 'hidden'}>
+      <div class="field"><label class="field-label">API Key</label>
+        <input class="input" id="ix-key" type="password" autocomplete="off"
+               placeholder="${hasCredentials ? '已保存，留空表示不修改' : ''}">
+        <div class="field-hint">API Key 是长期方案（登录换来的 JWT 只有 7 天）。平台通常只给管理员签发。</div>
+      </div>
+    </div>
+
+    <div class="field-row">
+      <div class="field" style="flex:0 0 150px"><label class="field-label">默认线路 ID</label>
+        <input class="input" id="ix-line" type="number" min="1" value="${esc(provider?.defaultLineId ?? '')}" placeholder="自动">
+        <div class="field-hint">留空 = 自动挑一条可用线路。</div>
+      </div>
+      <div class="field">
+        <div class="checkbox-row" style="margin-bottom:8px">
+          <input type="checkbox" id="ix-udp" ${provider ? (provider.enableUdp ? 'checked' : '') : 'checked'}>
+          <label for="ix-udp">中转端口开启 UDP 转发</label>
+        </div>
+        <div class="checkbox-row">
+          <input type="checkbox" id="ix-enabled" ${provider ? (provider.enabled ? 'checked' : '') : 'checked'}>
+          <label for="ix-enabled">启用（全局总闸，关掉后全部 profile 回落直连）</label>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal-hint">
+      协议参数一律不动，改写只发生在生成订阅的那一刻，库里的节点始终是原始地址。
+      UDP 未开启时，hysteria2 / tuic / QUIC 传输这类协议本体跑 UDP 的节点会被如实拒绝改写，而不是变成半通的死节点。
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn-sec" data-action="close-modal">取消</button>
+      <button class="btn-pri" data-action="ix-save-provider" data-id="${esc(provider?.id ?? '')}">${editing ? '保存' : '添加'}</button>
+    </div>`);
+}
+
+async function saveIxProvider(id) {
+  const authMode = document.getElementById('ix-auth').value;
+  const payload = {
+    name: document.getElementById('ix-name').value.trim(),
+    baseUrl: document.getElementById('ix-base').value.trim(),
+    authMode,
+    enableUdp: document.getElementById('ix-udp').checked,
+    enabled: document.getElementById('ix-enabled').checked,
+  };
+  if (!payload.name || !payload.baseUrl) {
+    toast('名称与 API 地址都不能为空', 'error');
+    return;
+  }
+
+  const key = document.getElementById('ix-key').value;
+  const username = document.getElementById('ix-user').value.trim();
+  const password = document.getElementById('ix-pass').value;
+  if (authMode === 'api-key') {
+    if (key) payload.apiKey = key;
+    else if (!id) {
+      toast('API Key 模式必须填 API Key', 'error');
+      return;
+    }
+  } else {
+    if (username) payload.username = username;
+    if (password) payload.password = password;
+    if (!id && (!username || !password)) {
+      toast('账号登录模式必须填账号和密码', 'error');
+      return;
+    }
+  }
+
+  // schema 是 `.nullable().optional()`，所以清空可以显式送 null（能真的清掉，
+  // 而不是留着上一次填的线路 id 悄悄继续生效）。
+  const line = document.getElementById('ix-line').value.trim();
+  payload.defaultLineId = line ? Number(line) : null;
+
+  if (id) await api.patch(`/ix/providers/${encodeURIComponent(id)}`, payload);
+  else await api.post('/ix/providers', payload);
+  closeModal();
+  toast(id ? '已保存，建议再测一次连接' : '已添加，先点「测试连接」拿线路与配额');
+  await reloadIx();
+}
+
+function ixConfirmModal({ title, body, danger, actionLabel, action, dataset = {} }) {
+  const attrs = Object.entries(dataset)
+    .map(([key, val]) => ` data-${key}="${esc(val)}"`)
+    .join('');
+  openModal(`
+    <div class="modal-title">${esc(title)}</div>
+    <div class="modal-hint">${body}</div>
+    <div class="modal-actions">
+      <button class="btn-sec" data-action="close-modal">取消</button>
+      <button class="${danger ? 'btn-danger' : 'btn-pri'}" data-action="${esc(action)}"${attrs}>${esc(actionLabel)}</button>
+    </div>`);
+}
+
+function ixMapPickedModal() {
+  if (!state.picked.size) {
+    toast('先勾选要走中转的节点', 'warn');
+    return;
+  }
+  const usable = state.ixProviders.filter((provider) => !provider.credentialBroken);
+  if (!usable.length) {
+    toast(state.ixProviders.length ? '中转商凭据不可用，请先重新录入' : '先到「IX 中转」添加一个中转商', 'error');
+    return;
+  }
+  // 上限来自 /meta（后端 IX_MAX_FINGERPRINTS），不在前端另抄一份数字。
+  const max = state.meta?.ixMaxFingerprints ?? 50;
+  if (state.picked.size > max) {
+    toast(`一次最多 ${max} 个节点（当前勾了 ${state.picked.size} 个）。端口配额是线路级的，分批来。`, 'error');
+    return;
+  }
+  const alreadyMapped = [...state.picked].filter((fingerprint) => state.ixMappings.some((m) => m.fingerprint === fingerprint)).length;
+
+  openModal(`
+    <div class="modal-title">为 ${state.picked.size} 个节点建立 IX 转发</div>
+    <div class="modal-sub">会在中转平台上建端口，是真实的外发操作。已有映射的节点会被跳过，不重复占配额。</div>
+    ${
+      usable.length > 1
+        ? `<div class="field"><label class="field-label">中转商</label>
+             <select class="select" id="ix-map-provider">
+               ${usable.map((provider) => `<option value="${esc(provider.id)}">${esc(provider.name)}</option>`).join('')}
+             </select></div>`
+        : ''
+    }
+    <div class="modal-hint">
+      <strong>先认领，再创建。</strong>平台上已有指向同一目标的端口会被直接认领（结果里显示「认领」），不占用新配额。<br>
+      <strong>端口配额是线路级的。</strong>超出上限时会给出可读原因并停止创建，不会去猜服务端文案。
+      ${alreadyMapped ? `<br>勾选里有 <b>${alreadyMapped}</b> 个节点已经有映射，本次会跳过。` : ''}
+    </div>
+    <div class="modal-actions">
+      <button class="btn-sec" data-action="close-modal">取消</button>
+      <button class="btn-pri" data-action="ix-map-confirm">建立转发</button>
+    </div>`);
+}
+
+async function runIxMapping() {
+  const providerId = document.getElementById('ix-map-provider')?.value || undefined;
+  const fingerprints = [...state.picked];
+  const payload = await api.post('/ix/mappings', {
+    ...(providerId ? { providerId } : {}),
+    fingerprints,
+  });
+  await reloadIx();
+  ixEnsureResultModal(payload);
+}
+
+const IX_OUTCOMES = {
+  created: ['s-active', '已新建'],
+  claimed: ['s-active', '已认领'],
+  skipped: ['s-pending', '已跳过'],
+  failed: ['s-error', '失败'],
+};
+
+/** 逐节点展示结果。`claimed` 必须与 `created` 区分开：它认领的是远端已有端口，不占新配额。 */
+function ixEnsureResultModal(payload) {
+  const items = Array.isArray(payload?.results)
+    ? payload.results
+    : Array.isArray(payload?.items)
+      ? payload.items
+      : [];
+  const warnings = Array.isArray(payload?.warnings) ? payload.warnings : [];
+  const nodesByFp = new Map(state.nodes.map((node) => [node.fingerprint, node]));
+  const counts = items.reduce((acc, item) => {
+    acc[item.outcome] = (acc[item.outcome] ?? 0) + 1;
+    return acc;
+  }, {});
+
+  const rows = items
+    .map((item) => {
+      // outcome 来自服务端，用 hasOwnProperty 查表：直接下标会命中
+      // `constructor` 之类的原型键，解构一个函数会当场抛异常。
+      const known = Object.prototype.hasOwnProperty.call(IX_OUTCOMES, item.outcome);
+      const [cls, label] = known ? IX_OUTCOMES[item.outcome] : ['s-pending', item.outcome ?? '未知'];
+      const name = item.name || nodesByFp.get(item.fingerprint)?.name || `${String(item.fingerprint ?? '').slice(0, 8)}…`;
+      const entry = item.entryHost && item.entryPort ? `${esc(item.entryHost)}:${esc(item.entryPort)}` : '';
+      const detail = item.reason ?? item.detail ?? '';
+      return `<tr>
+        <td><span class="ix-row-name">${esc(name)}</span></td>
+        <td><span class="ix-state ${cls}"><i></i>${esc(label)}</span></td>
+        <td class="ix-mono">${entry || '<span class="ix-cell-none">—</span>'}</td>
+        <td class="ix-row-err">${esc(detail)}</td>
+      </tr>`;
+    })
+    .join('');
+
+  openModal(`
+    <div class="modal-title">IX 转发建立结果</div>
+    <div class="modal-sub">
+      新建 ${counts.created ?? 0} · 认领 ${counts.claimed ?? 0} · 跳过 ${counts.skipped ?? 0} · 失败 ${counts.failed ?? 0}
+    </div>
+    ${payload?.error ? `<div class="err-box">${esc(payload.error)}</div>` : ''}
+    ${
+      warnings.length
+        ? `<div class="warn-box"><ul class="ix-unavail">${warnings.map((warning) => `<li>${esc(warning)}</li>`).join('')}</ul></div>`
+        : ''
+    }
+    ${
+      items.length
+        ? `<div class="table-scroll"><table class="ntable">
+             <thead><tr><th>节点</th><th>结果</th><th>中转入口</th><th>说明</th></tr></thead>
+             <tbody>${rows}</tbody></table></div>`
+        : '<div class="empty" style="padding:24px">没有返回任何逐节点结果</div>'
+    }
+    <div class="modal-hint">
+      「已认领」= 平台上原本就有指向同一目标的端口，直接接管，<strong>不占用新的端口配额</strong>。<br>
+      「已跳过」多半是本地已有映射（幂等），说明里写了具体原因。
+    </div>
+    <div class="modal-actions"><button class="btn-sec" data-action="close-modal">关闭</button></div>`, true);
+}
+
+async function removeIxMapping(fingerprint, providerId, deleteRemote) {
+  const query = new URLSearchParams({ deleteRemote: deleteRemote ? 'true' : 'false' });
+  if (providerId) query.set('providerId', providerId);
+  const result = await api.del(`/ix/mappings/${encodeURIComponent(fingerprint)}?${query.toString()}`);
+  closeModal();
+  if (result?.warning) toast(result.warning, 'warn');
+  const warnings = Array.isArray(result?.warnings) ? result.warnings : [];
+  warnings.forEach((warning) => toast(warning, 'warn'));
+  const remoteDeleted = result?.remoteDeleted ?? result?.remote_deleted;
+  toast(
+    deleteRemote
+      ? remoteDeleted
+        ? '已删除远端端口并解除映射'
+        : '本地映射已解除，但远端端口未能删除（详见提示）'
+      : '已解除本地映射，远端端口保留',
+    deleteRemote && !remoteDeleted ? 'warn' : 'ok',
+  );
+  await reloadIx();
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -2218,6 +3007,149 @@ document.addEventListener('click', async (e) => {
         await accessModal(id);
         break;
 
+      // ── IX 中转 ──
+      case 'ix-new-provider':
+        ixProviderModal(null);
+        break;
+
+      case 'ix-edit-provider':
+        ixProviderModal(state.ixProviders.find((provider) => provider.id === id));
+        break;
+
+      case 'ix-save-provider':
+        await saveIxProvider(id || null);
+        break;
+
+      case 'ix-delete-provider': {
+        const provider = state.ixProviders.find((item) => item.id === id);
+        const count = state.ixMappings.filter((mapping) => mapping.providerId === id).length;
+        ixConfirmModal({
+          title: '删除中转商',
+          body: `将删除「${esc(provider?.name ?? id)}」及其 <b>${count}</b> 条本地映射。
+                 <strong>平台上已建的转发端口不会被删除</strong>，仍然占着端口配额 ——
+                 需要收回请先在映射表里逐条「删除远端端口」，或到平台上手动清理。<br><br>
+                 只是想临时停用的话，关掉这个中转商的「全局总闸」就够了，数据都留着。`,
+          danger: true,
+          actionLabel: '确认删除',
+          action: 'ix-delete-provider-confirm',
+          dataset: { id },
+        });
+        break;
+      }
+
+      case 'ix-delete-provider-confirm': {
+        const result = await api.del(`/ix/providers/${encodeURIComponent(id)}`);
+        closeModal();
+        toast('中转商已删除');
+        // 「远端端口没被删、还占着配额」这句必须让用户看见 —— 界面上从此
+        // 再也看不到那些端口，只有这一次机会说清楚。
+        if (result?.warning) toast(result.warning, 'warn');
+        await reloadIx();
+        break;
+      }
+
+      // 两个开关共用一条路径。`finally` 里无条件重拉：请求失败时必须把开关
+      // 拨回服务端的真实状态，否则界面会显示成"已关闭"而实际总闸还开着。
+      case 'ix-toggle-enabled':
+      case 'ix-toggle-udp': {
+        const enabling = el.checked;
+        const patch = action === 'ix-toggle-enabled' ? { enabled: enabling } : { enableUdp: enabling };
+        try {
+          await api.patch(`/ix/providers/${encodeURIComponent(id)}`, patch);
+          toast(
+            action === 'ix-toggle-enabled'
+              ? enabling
+                ? '总闸已打开'
+                : '总闸已关闭，所有 profile 回落直连'
+              : enabling
+                ? '已标记中转端口支持 UDP'
+                : '已标记中转端口不转 UDP',
+          );
+        } finally {
+          await reloadIx();
+        }
+        break;
+      }
+
+      case 'ix-probe': {
+        el.disabled = true;
+        el.textContent = '测试中…';
+        try {
+          const payload = await api.post(`/ix/providers/${encodeURIComponent(id)}/probe`);
+          const probe = payload?.probe ?? payload;
+          if (probe?.ok) toast(`连接成功，拿到 ${probe.lines?.length ?? 0} 条线路`);
+          else toast(`连接失败：${probe?.error ?? '未知原因'}`, 'error');
+          (probe?.warnings ?? []).forEach((warning) => toast(warning, 'warn'));
+        } finally {
+          await reloadIx();
+        }
+        break;
+      }
+
+      case 'ix-refresh': {
+        el.disabled = true;
+        try {
+          const payload = await api.post('/ix/refresh', id ? { providerId: id } : {});
+          const results = Array.isArray(payload?.results) ? payload.results : payload?.results ? [payload.results] : [];
+          const sum = (key) => results.reduce((total, item) => total + (item?.[key] ?? 0), 0);
+          toast(`同步完成：检查 ${sum('checked')} 条，更新 ${sum('updated')} 条，新增孤儿 ${sum('orphaned')} 条`);
+          (payload?.warnings ?? []).forEach((warning) => toast(warning, 'warn'));
+        } finally {
+          el.disabled = false;
+          await reloadIx();
+        }
+        break;
+      }
+
+      case 'ix-map-picked':
+        ixMapPickedModal();
+        break;
+
+      case 'ix-map-confirm':
+        await runIxMapping();
+        break;
+
+      case 'ix-keep-orphan':
+        // 没有"保留"接口，也不该有：孤儿本来就不会被自动删。这里只是把
+        // 系统的真实行为讲清楚，不假装写了什么东西。
+        toast('孤儿映射不会被自动删除。节点回到订阅里之后，下一次同步会自动恢复。', 'ok');
+        break;
+
+      case 'ix-unlink': {
+        const mapping = state.ixMappings.find((item) => item.fingerprint === fp);
+        ixConfirmModal({
+          title: '解除本地映射',
+          body: `只删本地映射，<strong>平台上的端口保留</strong>（仍占端口配额）。
+                 该节点下次生成订阅时回落直连。<br><br>
+                 目标：<code>${esc(mapping?.targetHost ?? '')}:${esc(mapping?.targetPort ?? '')}</code>`,
+          actionLabel: '解除映射',
+          action: 'ix-remove-confirm',
+          dataset: { fp, id: mapping?.providerId ?? id ?? '', remote: 'false' },
+        });
+        break;
+      }
+
+      case 'ix-delete-remote': {
+        const mapping = state.ixMappings.find((item) => item.fingerprint === fp);
+        ixConfirmModal({
+          title: '删除远端端口',
+          body: `<strong>不可逆的外发操作</strong>：会调用中转平台的删端口接口，端口号被收回后不保证还能拿回同一个。
+                 用它的客户端在重新拉订阅之前会一直连一个已经不存在的入口。<br><br>
+                 端口 ID：<code>${esc(mapping?.remotePortId ?? '未知')}</code>
+                 入口：<code>${esc(mapping?.entryHost ?? '?')}:${esc(mapping?.entryPort ?? '?')}</code><br>
+                 目标：<code>${esc(mapping?.targetHost ?? '')}:${esc(mapping?.targetPort ?? '')}</code>`,
+          danger: true,
+          actionLabel: '确认删除远端端口',
+          action: 'ix-remove-confirm',
+          dataset: { fp, id: mapping?.providerId ?? id ?? '', remote: 'true' },
+        });
+        break;
+      }
+
+      case 'ix-remove-confirm':
+        await removeIxMapping(fp, id || undefined, el.dataset.remote === 'true');
+        break;
+
       case 'close-modal':
         if (document.getElementById('pane-profile-editor')?.classList.contains('active')) closeProfilePage();
         else closeModal();
@@ -2305,6 +3237,21 @@ document.addEventListener('change', (e) => {
   }
   if (e.target.id === 'p-pick-mode') {
     editingProfile.rule.pickMode = e.target.value;
+    return;
+  }
+  if (e.target.id === 'ix-auth') {
+    const key = document.getElementById('ix-group-key');
+    const login = document.getElementById('ix-group-login');
+    if (key) key.hidden = e.target.value !== 'api-key';
+    if (login) login.hidden = e.target.value === 'api-key';
+    return;
+  }
+  if (e.target.id === 'p-ix-fill') {
+    // 关掉补写等于让 SNI / ws-Host / h2-host / http-Host 全部回落到中转入口域名。
+    // 这不是一个"风格选项"，而是握手成败的开关，所以关掉时必须当场警告。
+    const warn = document.getElementById('p-ix-fill-warn');
+    if (warn) warn.hidden = e.target.checked;
+    if (!e.target.checked) toast('已关闭原始 SNI / Host 补写：TLS 类节点基本必然握手失败', 'warn');
   }
 });
 
@@ -2321,7 +3268,7 @@ function activateTab(tabName) {
   document.querySelectorAll('.tab').forEach((tab) => tab.classList.toggle('active', tab.dataset.tab === tabName));
   document.querySelectorAll('.side-nav-item[data-tab]').forEach((tab) => tab.classList.toggle('active', tab.dataset.tab === tabName));
   document.querySelectorAll('.pane').forEach((pane) => pane.classList.toggle('active', pane.id === `pane-${tabName}`));
-  const titles = { nodes: ['节点管理', '管理智能节点，支持多种协议和地区'], profiles: ['配置文件', '用清晰规则生成普通或链式订阅'], traffic: ['流量监控', '只展示来自上游的真实流量快照'], friends: ['共享管理', '管理好友、订阅链接和访问记录'], settings: ['系统设置', '查看服务状态并调整本机界面偏好'] };
+  const titles = { nodes: ['节点管理', '管理智能节点，支持多种协议和地区'], profiles: ['配置文件', '用清晰规则生成普通或链式订阅'], traffic: ['流量监控', '只展示来自上游的真实流量快照'], friends: ['共享管理', '管理好友、订阅链接和访问记录'], ix: ['IX 中转', '管理中转商、端口配额与节点映射'], settings: ['系统设置', '查看服务状态并调整本机界面偏好'] };
   const title = titles[tabName] ?? titles.nodes;
   document.getElementById('pageTitle').textContent = title[0];
   document.getElementById('pageSubtitle').textContent = title[1];

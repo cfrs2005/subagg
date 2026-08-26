@@ -10,7 +10,7 @@
     if (localStorage.getItem('subagg.theme') === 'dark') document.documentElement.dataset.theme = 'dark';
   } catch (_) { /* Private browsing may reject localStorage. */ }
 </script>
-<link rel="stylesheet" href="./style.css?v=20260825-qr1">
+<link rel="stylesheet" href="./style.css?v=20260826-ixudp">
 </head>
 <body>
 <div class="gate" id="gate">
@@ -32,6 +32,7 @@
       <button class="side-nav-item" data-tab="profiles"><span>▣</span>配置文件 <b id="profileCnt">0</b></button>
       <button class="side-nav-item" data-tab="traffic"><span>◒</span>流量监控</button>
       <button class="side-nav-item" data-tab="friends"><span>♧</span>共享管理 <b id="friendCnt">0</b></button>
+      <button class="side-nav-item" data-tab="ix"><span>⇄</span>IX 中转 <b id="ixCnt">0</b></button>
       <div class="side-nav-label side-nav-label-spaced">系统管理</div>
       <button class="side-nav-item" data-action="side-sync"><span>↻</span>同步订阅</button>
       <button class="side-nav-item" data-tab="settings"><span>⚙</span>系统设置</button>
@@ -53,18 +54,20 @@
       <button class="tab" data-tab="profiles">配置文件</button>
       <button class="tab" data-tab="traffic">流量监控</button>
       <button class="tab" data-tab="friends">共享管理</button>
+      <button class="tab" data-tab="ix">IX 中转</button>
     </div>
     <div class="tab-body">
       <div class="pane active" id="pane-nodes">
         <div class="page-actions"><div><h2>节点列表</h2><p>查看、筛选和测试当前订阅中的节点。</p></div><div class="page-action-buttons"><button class="btn-sec" id="syncBtn">↻ 全部同步</button><button class="btn-sec" id="pingAllBtn" data-action="ping-all-nodes">ϟ 测试全部节点</button><button class="btn-pri" id="newProfileBtn">＋ 添加配置</button></div></div>
         <div class="node-stats" id="nodeStats"></div>
         <div class="filter-bar redesigned-filter"><div class="search-wrap"><span>⌕</span><input class="search" type="text" id="searchQ" placeholder="搜索节点名称 / 服务器地址..."></div><select class="select filter-select" id="nodeSourceFilter"><option value="">全部来源</option></select><select class="select filter-select" id="nodeRegionFilter"><option value="">全部地区</option></select><select class="select filter-select" id="nodeTypeFilter"><option value="">全部协议</option></select><select class="select filter-select" id="nodeStatusFilter"><option value="">全部状态</option><option value="online">在线</option><option value="offline">离线</option><option value="unknown">未测试</option></select><select class="select filter-select" id="nodeSort"><option value="default">默认顺序</option><option value="name">名称</option><option value="port">端口</option><option value="status">连通状态</option><option value="latency">TCP 延迟</option></select><button class="filter-reset" data-action="reset-node-filters">↻ 重置</button><span class="fsumm" id="fsumm"></span></div>
-        <div class="node-workspace"><section class="node-list-card"><div class="table-scroll"><table class="ntable"><thead><tr><th class="pick-cell"><input type="checkbox" disabled></th><th>节点名称</th><th>协议</th><th>地区</th><th>服务器</th><th>端口</th><th>延迟</th><th>状态</th><th>来源</th><th>操作</th></tr></thead><tbody id="nodeBody"></tbody></table></div><div class="table-foot"><span id="nodeFootCount">显示 0 条</span><div class="pagination" id="nodePagination"></div></div></section></div>
+        <div class="node-workspace"><section class="node-list-card"><div class="table-scroll"><table class="ntable"><thead><tr><th class="pick-cell"><input type="checkbox" disabled></th><th>节点名称</th><th>协议</th><th>地区</th><th>服务器</th><th>端口</th><th>延迟</th><th>状态</th><th>来源</th><th>中转</th><th>操作</th></tr></thead><tbody id="nodeBody"></tbody></table></div><div class="table-foot"><span id="nodeFootCount">显示 0 条</span><div class="pagination" id="nodePagination"></div></div></section></div>
       </div>
       <div class="pane" id="pane-profiles"><div class="page-actions"><div><h2>配置文件</h2><p>用一组清晰规则生成普通或链式订阅。</p></div><button class="btn-pri" id="newProfileBtnDuplicate">＋ 新建配置</button></div><div class="pgrid" id="profileGrid"></div></div>
       <div class="pane" id="pane-profile-editor" aria-label="订阅配置编辑页面"></div>
       <div class="pane" id="pane-traffic"><div class="page-actions"><div><h2>流量监控</h2><p>只展示来自上游的真实流量快照。</p></div><button class="btn-sec" id="refreshTrafficBtn">↻ 刷新数据</button></div><div class="tgrid" id="trafficGrid"></div></div>
       <div class="pane" id="pane-friends"><div class="page-actions"><div><h2>共享管理</h2><p>管理好友、订阅链接和访问记录。</p></div><button class="btn-pri" id="addFriendBtn">＋ 添加好友</button></div><div class="warn-box"><strong>关于流量计量</strong>：好友的代理流量不经过本服务。下方只展示真实的订阅拉取记录。</div><div class="fgrid" id="friendsGrid"></div></div>
+      <div class="pane" id="pane-ix"><div class="page-actions"><div><h2>IX 中转</h2><p>把选中节点的入口地址换成中转入口，协议参数一字不动。</p></div><div class="page-action-buttons"><button class="btn-sec" data-action="ix-refresh">↻ 同步状态</button><button class="btn-pri" data-action="ix-new-provider">＋ 添加中转商</button></div></div><div class="ix-body" id="ixBody"></div></div>
       <div class="pane" id="pane-settings"><div class="page-actions"><div><h2>系统设置</h2><p>查看当前服务状态并调整本机界面偏好。</p></div></div><div class="settings-grid" id="settingsGrid"></div></div>
     </div>
   </main>
@@ -72,6 +75,6 @@
 
 <div class="overlay" id="overlay"><div class="modal" id="modal"></div></div>
 <div class="toasts" id="toasts"></div>
-<script type="module" src="./app.js?v=20260825-qr1"></script>
+<script type="module" src="./app.js?v=20260826-ixudp"></script>
 </body>
 </html>

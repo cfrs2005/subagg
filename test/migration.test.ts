@@ -18,11 +18,22 @@ describe('database migrations', () => {
     expect(columns.map((column) => column.name)).toEqual(expect.arrayContaining(['max_access', 'quota_window_hours', 'source_limit']));
     expect((db.prepare('SELECT COUNT(*) AS n FROM tokens').get() as { n: number }).n).toBe(before.n);
     expect(db.prepare('SELECT max_access, quota_window_hours, source_limit FROM tokens WHERE token = ?').get('legacy')).toEqual({ max_access: null, quota_window_hours: null, source_limit: null });
-    expect((db.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get() as { n: number }).n).toBe(3);
+    expect((db.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get() as { n: number }).n).toBe(5);
     const pingTable = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'node_ping_history'").get();
     expect(pingTable).toBeTruthy();
+    // v5 的端口级 UDP 能力列：必须可空，NULL 表示"还没同步过、事实未知"。
+    // 给它加 NOT NULL DEFAULT 0/1 都是把"未知"伪装成一个事实。
+    const ixColumns = db.prepare('PRAGMA table_info(ix_port_mappings)').all() as {
+      name: string;
+      notnull: number;
+      dflt_value: unknown;
+    }[];
+    const entryUdp = ixColumns.find((column) => column.name === 'entry_udp');
+    expect(entryUdp).toBeTruthy();
+    expect(entryUdp?.notnull).toBe(0);
+    expect(entryUdp?.dflt_value).toBeNull();
     migrate(db, logger, MIGRATIONS);
-    expect((db.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get() as { n: number }).n).toBe(3);
+    expect((db.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get() as { n: number }).n).toBe(5);
     db.close();
   });
 });

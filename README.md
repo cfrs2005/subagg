@@ -2,9 +2,10 @@
 
 # subagg
 
-**Self-hosted proxy subscription aggregator.**
+**Self-hosted proxy subscription aggregator, with optional relay orchestration.**
 
-One link that adapts to whatever client asks for it.
+One link that adapts to whatever client asks for it — and, if you want, dials a
+nearby relay entry instead of your provider's landing server.
 
 [中文文档](./README.zh-CN.md) · [Security](./SECURITY.md) · [Contributing](./CONTRIBUTING.md)
 
@@ -29,7 +30,7 @@ several upstream subscriptions
         ▼  fetch, parse into one node model
    filter rules  (region / protocol / regex / manual picks / dedupe / rename)
         │
-        ▼
+        ▼  optional: swap the dial-out address for a relay entry (IX)
    https://your-host/sub/<token>
         │
         ├─ Clash asks       → YAML with proxy groups and rules
@@ -39,6 +40,11 @@ several upstream subscriptions
 
 The format is chosen from the client's `User-Agent`. Add `?target=clash.meta`
 to force one.
+
+That optional step in the middle is the second half of the product: subagg can
+also drive a layer-4 port-forwarding platform, so the link it hands out points
+at a nearby relay entry rather than at your provider directly. See
+[IX relay orchestration](#ix-relay-orchestration).
 
 ## Features
 
@@ -60,6 +66,12 @@ to force one.
   node URI. The encoder is a self-contained pure function: **everything is computed
   locally with zero outbound requests** — that link is equivalent to credentials for
   every node, so it is never handed to a third-party QR service.
+- **IX relay orchestration** *(optional, off by default)* — have subagg create the
+  forwarding ports on a layer-4 relay platform and serve the relay entry address
+  instead of the landing server. **Only `server` and `port` are rewritten**; UUID,
+  password, TLS, SNI, Host, path and every other protocol parameter stay byte for
+  byte identical. Per-profile switch plus a global kill switch, and any node whose
+  mapping isn't usable falls back to a direct connection with a readable reason.
 
 ## Screenshots
 
@@ -130,7 +142,154 @@ Response headers worth knowing:
 | `X-Subagg-Nodes` | How many nodes went into the config |
 | `X-Subagg-Target` | Which format was chosen, and why (`ua` / `query` / `default`) |
 | `X-Subagg-Skipped` | How many nodes the target format can't represent |
+| `X-Subagg-IX` | Relay rewriting, when enabled: `rewritten=N; direct=N; dropped=N` |
+| `X-Subagg-IX-Reason` | Reason code for the first node that was *not* rewritten |
 | `X-Subagg-Warning` | Anything else you should know |
+
+## IX relay orchestration
+
+Optional, and off until you switch it on for a specific profile.
+
+The problem it solves is **link quality**, not reachability: the hop from your
+device to your provider's landing server is not something you control (it may
+route the long way round, or get throttled). A layer-4 port-forwarding platform
+gives you a nearby entry address and forwards the bytes on to the landing
+server, so the long haul happens on a network somebody is paid to keep fast.
+
+```
+client ──▶ IX entry (nearby) ──▶ original landing server
+```
+
+Layer 4 means the relay never terminates TLS and never inspects the payload.
+So subagg rewrites **only the dial-out address** — `server` and `port`. UUID,
+password, cipher, TLS, SNI, ALPN, REALITY, Host, path, gRPC service name, flow:
+all untouched, byte for byte identical to the direct version. The rewrite
+happens while the subscription is being rendered and is **never written to the
+database**; the node in your library always keeps its original address, so your
+manual picks, ping history and mappings survive.
+
+One consequence of that is worth knowing, because it is where handshakes live or
+die. `server` quietly doubles as "who do we handshake with" in four places —
+`tls.sni`, `ws.headers.Host`, `h2.host` and `http.headers.Host` all fall back to
+`server` when they're empty. Changing `server` therefore silently changes those
+four values too, so subagg writes the **original** server into them explicitly.
+That is not new behaviour; it pins down the default that was already in effect.
+It is on by default (`fillOriginHost`) and you should leave it on — turning it
+off makes TLS nodes present the *relay's* hostname as their SNI, which fails,
+invisibly.
+
+### Setting it up
+
+1. **Add a provider** — the "IX 中转" tab → *添加中转商*. You need the API base
+   URL (e.g. `https://<platform-host>/api`) and credentials.
+2. **Test connection** — pulls the line list, per-line port quota, traffic, expiry
+   and, explicitly, a list of what your account *cannot* do.
+3. **Create the forwarding ports** — node table → tick the nodes you want →
+   *建立 IX 转发* (50 fingerprints per batch, at most). If the platform already
+   has a port pointing at the same `host:port`, subagg **claims** it rather than
+   creating a duplicate — quotas are small enough that this matters.
+4. **Enable it on a profile** — profile editor → the "IX 中转" panel → on. Only
+   profiles with that switch on get rewritten; everything else keeps serving
+   direct addresses.
+
+### Authentication
+
+Two modes, both first-class:
+
+- **`X-API-Key` (preferred).** A long-lived key, which on these platforms is
+  usually issued by an administrator. Ask for the least it can be: enough to read
+  and write forwarding ports and to read your own subscription/quota — on the
+  platform we integrated against that is `ports_traffic` + `subscription_link`.
+  **Do not ask for `full`, `admin_system` or `agent_exec`**: subagg never needs
+  them, and a key that can do everything is a key you cannot safely leave in a
+  database. (These scope names come from the platform's own permission list;
+  subagg itself never inspects them, it just sends the header.)
+- **Account login (fallback).** Username and password are exchanged for a JWT —
+  measured at **7 days**, renewed automatically (proactively 5 minutes before
+  expiry, plus exactly one re-login on a `401`). This is the only option if your
+  administrator won't issue a key. Note the ceiling: **if the platform ever turns
+  on a login captcha, this path stops working** and there is no way around it
+  except an API key.
+
+### Limits you should know before you start
+
+- **Port quota is per line, not per account**, and it is small — on the account
+  this was built against, 30 ports per line. An aggregated node list is routinely
+  much larger than that, which is why node selection is **a manual pick, not
+  "relay everything"**. subagg checks the quota locally before creating anything
+  and tells you which line is full.
+- **Direct forwarding only, if your account says so.** Chained relays, custom
+  forward endpoints and inbound proxying are account/line capabilities. Where the
+  platform has them switched off, subagg only ever uses plain direct forwarding —
+  and the connection test spells out which of them you don't have.
+- **Some nodes are deliberately refused.** Where the address change would force
+  subagg to guess a disguise parameter, it declines to rewrite and leaves the node
+  direct: REALITY without an explicit `sni`, Shadowsocks with an obfuscation
+  plugin, ShadowsocksR obfuscation that needs a host, plaintext gRPC, and
+  UDP-native protocols (Hysteria2 / TUIC / QUIC) behind a port that doesn't forward
+  UDP. Every one of them reports why, and what to do instead.
+- **UDP is a property of the port.** If the forwarding port doesn't carry UDP, the
+  node's UDP capability is honestly downgraded to `false` rather than left to
+  silently black-hole UDP traffic. Where the platform hasn't reported the port's
+  UDP capability yet, subagg says so in a warning instead of guessing.
+
+### When something breaks
+
+Two switches, in increasing order of bluntness:
+
+- **Per profile** — turn the profile's IX switch off, refetch, and that
+  subscription is back on direct addresses immediately.
+- **Global kill switch** — turn a provider's master switch off and *every* profile
+  falls back to direct at once. This is the thing to reach for at 3am.
+
+You never have to reach for either just because the platform is down. Rendering a
+subscription **makes zero outbound requests** — it only reads the local mapping
+table — so the relay platform being unreachable, rate-limited or expired does not
+stop subscriptions from being served. Mappings that aren't usable simply fall back
+to direct, and the reason comes back in `X-Subagg-IX` / `X-Subagg-IX-Reason` and
+in the UI, per node.
+
+### Two different latencies — do not add them up
+
+- The latency in the **node table** is measured by subagg: *this host → the
+  original landing server, directly*. It is a TCP connect against the address in
+  the database, which is always the original one.
+- The latency on an **IX mapping** is measured by the relay platform: *relay entry
+  → original landing server*.
+
+They measure different segments, and their sum is not your end-to-end latency
+either. subagg shows both, labelled, and derives nothing from them — same reason
+there is no "estimated usage" figure anywhere.
+
+### About credential encryption (read this before trusting it)
+
+Provider credentials (API key, password, cached JWT) are encrypted with
+AES-256-GCM before being stored, with the key derived from your `ADMIN_TOKEN`.
+
+Be clear about what that buys you. It protects against **the database file
+leaving the machine on its own**: a backup synced to cloud storage, `data/subagg.db`
+committed by accident, the file handed to someone while debugging. In all of those
+the ciphertext travels and `ADMIN_TOKEN` (in `.env` or a systemd `EnvironmentFile`)
+does not. It does **not** protect against a compromised host — an attacker who can
+read the database can usually read `.env` too. It raises the bar from "get the
+file" to "get the file *and* the environment".
+
+The cost is unavoidable and you should plan for it: **rotating `ADMIN_TOKEN`
+makes already-stored credentials permanently undecryptable.** That is arithmetic,
+not a bug. subagg handles it gracefully — the provider is flagged as needing
+re-entry, affected profiles fall back to direct, nothing crashes — but you will
+have to type the credentials in again.
+
+### Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IX_SYNC_INTERVAL_HOURS` | `6` | How often to reconcile local mappings with the platform. **`0` disables the background sync**, which only stops status from refreshing — subscriptions keep being served either way. Max 168. |
+| `IX_TIMEOUT_MS` | `15000` | Per-request timeout for platform API calls. It's an external service; it must not be able to stall the scheduler. Range 1000–120000. |
+| `IX_ORPHAN_THRESHOLD` | `5` | How many consecutive syncs a node may be missing from every subscription before its mapping is flagged an orphan. Deliberately not `1`: upstreams return incomplete lists often enough that one miss means nothing. Orphans are **flagged only** — no remote port is ever deleted automatically. Range 1–100. |
+
+No new required secrets: the encryption key is derived from the `ADMIN_TOKEN`
+you already have.
 
 ## A note on Clash vs Clash.Meta
 
@@ -160,12 +319,18 @@ would be fabricated. For real numbers, check your provider's dashboard.
 src/core/       pure functions — no IO, fully unit-tested
   parse/        subscription formats → one node model
   filter.ts     the rule engine
+  ix.ts         relay rewriting — swaps the dial-out address, nothing else
+  secret.ts     AES-256-GCM sealing for stored credentials
   emit/         node model → client formats, plus the capability matrix
 src/db/         SQLite persistence
-src/services/   fetch, sync, schedule, render
+src/services/   fetch, sync, schedule, render, relay orchestration
 src/server/     HTTP: /sub/:token (public) and /api/* (authenticated)
 public/         zero-build frontend — plain ES modules, no bundler
 ```
+
+The render pipeline is `filter → ix → chain → emit`, and that order is load
+bearing rather than incidental — see `src/core/ix.ts`, which explains why in its
+header comment.
 
 The `core/` layer is deliberately IO-free. Protocol parsing and config generation
 are where the bugs live, and keeping side effects out means every branch is

@@ -184,4 +184,112 @@ CREATE TABLE node_ping_history (
 CREATE INDEX idx_node_ping_fingerprint_ts ON node_ping_history(fingerprint, ts DESC);
 `,
   },
+  {
+    version: 4,
+    name: 'ix_forwarding',
+    sql: `
+-- ── IX 中转服务商 ─────────────────────────────────────────
+-- 一行 = 一个 L4 端口转发平台账号（当前只有 relay.example.com）。
+CREATE TABLE ix_providers (
+  id              TEXT PRIMARY KEY,
+  name            TEXT    NOT NULL,
+  -- API 基址，如 https://relay.example.com/api
+  base_url        TEXT    NOT NULL,
+  -- 'api-key' | 'login'。不加 CHECK 约束：既有表都没有这种先例，
+  -- 收窄统一放在仓储的 to* 映射里做（带安全兜底），风格保持一致。
+  auth_mode       TEXT    NOT NULL DEFAULT 'login',
+  -- ⚠️ 以下三个 *_enc 列存的是 AES-256-GCM 密文（core/secret.ts 的
+  -- "v1:<base64url>" 形态），**不是明文**。列名带 _enc 后缀就是为了让
+  -- 任何人扫一眼 schema 就知道不能拿去直接用。
+  -- 密钥从 ADMIN_TOKEN 派生 —— 轮换 ADMIN_TOKEN 后这些密文解不开，
+  -- 届时应把 provider 标成"需重新录入凭据"并回落直连，不是让服务崩。
+  api_key_enc     TEXT,
+  username        TEXT,
+  password_enc    TEXT,
+  -- 登录换来的 JWT（实测 7 天过期）。缓存下来避免每次同步都重登。
+  jwt_enc         TEXT,
+  jwt_expires_at  INTEGER,
+  -- 建端口时默认落在哪条线路上。NULL = 用平台返回的第一条。
+  default_line_id INTEGER,
+  enable_udp      INTEGER NOT NULL DEFAULT 1,
+  -- 全局总闸。关掉后所有 profile 一起回落直连，用于故障时一键止血。
+  enabled         INTEGER NOT NULL DEFAULT 1,
+  last_probe_at   INTEGER,
+  last_error      TEXT,
+  -- 平台返回的额度/线路快照原文 JSON。原样存、原样展示，不做任何推导
+  -- （项目产品原则：不编造数据）。
+  quota_json      TEXT,
+  created_at      INTEGER NOT NULL,
+  updated_at      INTEGER NOT NULL
+);
+
+-- ── 节点 ↔ 远端转发端口的映射 ──────────────────────────────
+-- 主键用 (provider_id, fingerprint)：指纹是全系统节点主键，机场改名、
+-- 上游刷新都不会动它，所以映射能跨刷新存活。
+--
+-- target_host / target_port 冗余存原节点地址，有两个用途：
+--   ① 认领远端已有端口时精确比对 target_address_list（服务端的 target
+--      筛选是**子串模糊**匹配，landing-a.example:200 会误命中 :2002 和 :2004，
+--      必须在客户端再精确比一次）；
+--   ② 校验"这条映射指向的还是不是这个节点"。
+CREATE TABLE ix_port_mappings (
+  provider_id      TEXT    NOT NULL REFERENCES ix_providers(id) ON DELETE CASCADE,
+  fingerprint      TEXT    NOT NULL,
+  -- 远端端口 id。NULL = 还没建/还没认领（state='pending'）。
+  remote_port_id   INTEGER,
+  -- 中转入口。端口号由平台分配，所以建成之前是 NULL —— 不给默认 0，
+  -- 因为 port 0 是个能一路混进客户端配置的假值。
+  entry_host       TEXT,
+  entry_port       INTEGER,
+  target_host      TEXT    NOT NULL,
+  target_port      INTEGER NOT NULL,
+  line_id          INTEGER,
+  line_name        TEXT,
+  -- 'pending' | 'active' | 'error' | 'orphan'
+  state            TEXT    NOT NULL DEFAULT 'pending',
+  last_error       TEXT,
+  -- 平台 current_latency_summary 的原始口径：微秒整数、丢包率浮点。
+  -- 注意这是「中转入口 → 原落地」那一段的延迟，不是端到端。
+  latency_us       INTEGER,
+  loss_rate        REAL,
+  -- 字节数，平台原样返回。
+  traffic_in       INTEGER,
+  traffic_out      INTEGER,
+  suspended        INTEGER NOT NULL DEFAULT 0,
+  -- 平台侧的下发同步错误（sync_error_message），与 last_error 不是一回事：
+  -- 那是我们调用 API 的错误，这是平台把配置推给转发节点时的错误。
+  sync_error       TEXT,
+  -- 连续几轮同步没在节点集里见到这个指纹。累到阈值即标 orphan。
+  -- 按用户决策：只标记 + 界面高亮，绝不自动删远端端口。
+  missing_count    INTEGER NOT NULL DEFAULT 0,
+  remote_synced_at INTEGER,
+  created_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL,
+  PRIMARY KEY (provider_id, fingerprint)
+);
+-- 界面按状态筛（孤儿高亮、待创建列表）走这个索引。
+CREATE INDEX idx_ix_map_state ON ix_port_mappings(state);
+-- 按指纹跨 provider 反查（节点详情页要显示"这个节点走哪个中转"）。
+-- 复合主键的前导列是 provider_id，单查指纹用不上它，得单独建。
+CREATE INDEX idx_ix_map_fingerprint ON ix_port_mappings(fingerprint);
+`,
+  },
+  {
+    version: 5,
+    name: 'ix_port_udp',
+    sql: `
+-- ── 端口级 UDP 转发能力 ────────────────────────────────────
+-- 来源只有一个：GET /ports 里那个 port 的 enable_udp 字段。
+--
+-- 刻意**可空**，三态：1 = 转、0 = 不转、NULL = 还没同步过、事实未知。
+--
+-- NULL 绝不许被"顺手填个默认值"抹平。ix_providers.enable_udp 是我们**建端口时**
+-- 用的请求参数，不是这个端口**当前**的状态 —— 用户在平台上手工关掉某个端口的
+-- UDP，我们只能靠同步看见。拿默认值当事实，等于把"假装知道"当成"知道"：
+-- hysteria2 / tuic / QUIC 这类本体跑在 UDP 上的节点会被当成可改写，输出一个
+-- TCP 通、UDP 黑洞的死节点（最难归因的那种半坏）。
+-- 保持 NULL 则 core 的 udpPolicy 会走"改写 + 留警告"，如实说"我还不知道"。
+ALTER TABLE ix_port_mappings ADD COLUMN entry_udp INTEGER;
+`,
+  },
 ];
