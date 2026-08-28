@@ -63,4 +63,22 @@ export default tseslint.config(
       'no-unused-vars': ['warn', { argsIgnorePattern: '^_' }],
     },
   },
+  {
+    // 审计工具：手动跑的诊断脚本，Node 环境。见 scripts/audit/README.md。
+    // 用 CommonJS 是刻意的 —— 这些脚本要能在没装依赖、没走构建的情况下直接 `node` 起来。
+    files: ['scripts/**/*.cjs', 'scripts/**/*.mts'],
+    languageOptions: {
+      ecmaVersion: 2022,
+      globals: {
+        require: 'readonly',
+        module: 'writable',
+        process: 'readonly',
+        console: 'readonly',
+        __dirname: 'readonly',
+      },
+    },
+    rules: {
+      '@typescript-eslint/no-require-imports': 'off',
+    },
+  },
 );
