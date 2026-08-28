@@ -499,15 +499,6 @@ export class AccessLogRepo {
     return rows.map(toAccess);
   }
 
-  usageForToken(token: string, since: number | null = null): TokenUsage {
-    const where = since === null ? 'token = ?' : 'token = ? AND ts >= ?';
-    const args = since === null ? [token] : [token, since];
-    const row = this.db
-      .prepare(`SELECT COUNT(*) AS used, COUNT(DISTINCT ip_hash) AS sources, MIN(ts) AS oldest FROM access_log WHERE ${where}`)
-      .get(...args) as { used: number; sources: number; oldest: number | null };
-    return { used: row.used, distinctSources: row.sources, oldest: row.oldest };
-  }
-
   /**
    * 某位好友的访问概况。
    *

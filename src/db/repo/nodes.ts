@@ -119,20 +119,6 @@ export class NodeRepo {
     return rows.map(toNode).filter((n): n is StoredNode => n !== undefined);
   }
 
-  listBySubscription(subscriptionId: string): StoredNode[] {
-    const rows = this.db
-      .prepare('SELECT * FROM nodes WHERE subscription_id = ? ORDER BY name')
-      .all(subscriptionId) as NodeRow[];
-    return rows.map(toNode).filter((n): n is StoredNode => n !== undefined);
-  }
-
-  countBySubscription(subscriptionId: string): number {
-    const row = this.db
-      .prepare('SELECT COUNT(*) AS c FROM nodes WHERE subscription_id = ?')
-      .get(subscriptionId) as { c: number };
-    return row.c;
-  }
-
   /**
    * 当前存在的全部地区代码。供 Web 界面构建筛选器选项。
    *
