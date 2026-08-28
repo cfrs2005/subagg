@@ -11,6 +11,8 @@
 
 import type { IxMapping, IxMappingRepo, IxMappingState, IxProvider } from '../db/repo/ix.js';
 import type { NodeRepo, StoredNode } from '../db/repo/nodes.js';
+import { checkIxSafety } from '../core/ix.js';
+import { deriveIxRelayFingerprint } from '../core/fingerprint.js';
 import type { Logger } from '../logger.js';
 import { describeError, mappingPatchFromPort, providerRef, targetOf, type IxPlatformClient } from './ix-mapping.js';
 import type { IxMutationResult, IxPort } from './ix-protocol.js';
@@ -30,6 +32,8 @@ export interface IxEnsureItem {
   remotePortId?: number;
   entryHost?: string;
   entryPort?: number;
+  relayFingerprint?: string;
+  relayName?: string;
 }
 
 export interface IxEnsureResult {
@@ -68,8 +72,15 @@ function missingNodeItem(fingerprint: string, existing: IxMapping | undefined): 
   };
 }
 
-function skippedItem(fingerprint: string, name: string, existing: IxMapping): IxEnsureItem {
-  const item: IxEnsureItem = { fingerprint, name, outcome: 'skipped', detail: DETAIL_SKIPPED };
+function skippedItem(providerId: string, fingerprint: string, name: string, existing: IxMapping): IxEnsureItem {
+  const item: IxEnsureItem = {
+    fingerprint,
+    name,
+    outcome: 'skipped',
+    detail: DETAIL_SKIPPED,
+    relayFingerprint: deriveIxRelayFingerprint(providerId, fingerprint),
+    relayName: `IX_${name}`,
+  };
   if (existing.remotePortId !== null) item.remotePortId = existing.remotePortId;
   if (existing.entryHost !== null) item.entryHost = existing.entryHost;
   if (existing.entryPort !== null) item.entryPort = existing.entryPort;
@@ -208,7 +219,17 @@ async function ensureOne(
 
   // 幂等第一关：本地已有映射就不再动远端。孤儿例外 —— 那是"节点回来了"，
   // 该重新走一遍认领/创建把它救回 active。
-  if (existing && existing.state !== 'orphan') return skippedItem(fingerprint, node.name, existing);
+  if (existing && existing.state !== 'orphan') return skippedItem(provider.id, fingerprint, node.name, existing);
+
+  const safety = checkIxSafety(node);
+  if (!safety.ok) {
+    return {
+      fingerprint,
+      name: node.name,
+      outcome: 'failed',
+      detail: `${safety.detail} 未调用 IX 创建接口，也未占用端口配额。`,
+    };
+  }
 
   const target = targetOf(node.server, node.port);
   const now = input.now();
@@ -314,7 +335,14 @@ function writeMapping(
     },
     now,
   );
-  const item: IxEnsureItem = { fingerprint, name: node.name, outcome, detail };
+  const item: IxEnsureItem = {
+    fingerprint,
+    name: node.name,
+    outcome,
+    detail,
+    relayFingerprint: deriveIxRelayFingerprint(input.provider.id, fingerprint),
+    relayName: `IX_${node.name}`,
+  };
   if (saved.remotePortId !== null) item.remotePortId = saved.remotePortId;
   if (saved.entryHost !== null) item.entryHost = saved.entryHost;
   if (saved.entryPort !== null) item.entryPort = saved.entryPort;

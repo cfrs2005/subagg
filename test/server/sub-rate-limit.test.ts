@@ -34,7 +34,7 @@ function makeConfig(over: Partial<Config> = {}): Config {
     fetchUserAgent: 'test',
     schedulerIntervalMin: 0,
     nodePingIntervalHours: 12,
-    ixSyncIntervalHours: 0,
+    ixSyncIntervalMinutes: 0,
     ixTimeoutMs: 15_000,
     ixOrphanThreshold: 5,
     subRateLimit: 1000,

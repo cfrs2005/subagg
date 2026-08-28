@@ -33,4 +33,58 @@ describe('chain expansion', () => {
     expect(outcome.stats.pairCount).toBe(0);
     expect(outcome.warnings.join(' ')).toContain('为空');
   });
+
+  it('resolves chain roles outside the direct-node selection', () => {
+    const direct = node('d1', 'Direct', 'direct.example');
+    const entries = [node('e1', 'Entry 1', 'entry1.example'), node('e2', 'Entry 2', 'entry2.example')];
+    const landings = [
+      node('l1', 'Landing 1', 'landing1.example'),
+      node('l2', 'Landing 2', 'landing2.example'),
+      node('l3', 'Landing 3', 'landing3.example'),
+    ];
+    const outcome = expandChain([direct], {
+      enabled: true,
+      entry: { pick: entries.map((entry) => entry.fingerprint) },
+      landing: { pick: landings.map((landing) => landing.fingerprint) },
+    }, [direct, ...entries, ...landings]);
+
+    expect(outcome.stats).toMatchObject({ entryCount: 2, landingCount: 3, pairCount: 6 });
+    expect(outcome.nodes.filter((item) => item.chain)).toHaveLength(6);
+    expect(outcome.nodes.some((item) => item.fingerprint === direct.fingerprint)).toBe(true);
+    expect(outcome.nodes).toHaveLength(9);
+    expect(outcome.warnings).toEqual([]);
+  });
+
+  it('adds out-of-filter landings as direct nodes only when requested', () => {
+    const direct = node('d1', 'Direct', 'direct.example');
+    const entry = node('e1', 'Entry', 'entry.example');
+    const landing = node('l1', 'Landing', 'landing.example');
+    const outcome = expandChain([direct], {
+      enabled: true,
+      entry: { pick: [entry.fingerprint] },
+      landing: { pick: [landing.fingerprint] },
+      keepLandingDirect: true,
+    }, [direct, entry, landing]);
+
+    expect(outcome.stats).toMatchObject({ pairCount: 1, removedDirectLanding: 0 });
+    expect(outcome.nodes.map((item) => item.fingerprint)).toEqual([
+      entry.fingerprint,
+      direct.fingerprint,
+      landing.fingerprint,
+      expect.any(String),
+    ]);
+  });
+
+  it('uses a manual short name and keeps multiple pairs unique', () => {
+    const entries = [node('e1', 'Very long entry 1', 'entry1.example'), node('e2', 'Very long entry 2', 'entry2.example')];
+    const landing = node('l1', 'US-DLOS-SS2022', 'landing.example');
+    const outcome = expandChain([...entries, landing], {
+      enabled: true,
+      entry: { pick: entries.map((entry) => entry.fingerprint) },
+      landing: { pick: [landing.fingerprint] },
+      nameTemplate: '美国中转',
+    });
+
+    expect(outcome.nodes.filter((item) => item.chain).map((item) => item.name)).toEqual(['美国中转', '美国中转 2']);
+  });
 });

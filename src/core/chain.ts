@@ -74,7 +74,11 @@ function templateName(template: string, landing: ProxyNode, entry: ProxyNode, se
   });
 }
 
-export function expandChain(nodes: readonly ProxyNode[], rule: ChainRule | undefined): ChainOutcome {
+export function expandChain(
+  nodes: readonly ProxyNode[],
+  rule: ChainRule | undefined,
+  roleNodes: readonly ProxyNode[] = nodes,
+): ChainOutcome {
   const warnings: string[] = [];
   const stats: ChainStats = {
     entryCount: 0,
@@ -91,14 +95,14 @@ export function expandChain(nodes: readonly ProxyNode[], rule: ChainRule | undef
 
   for (const [role, selector] of [['入口', rule.entry], ['落地', rule.landing]] as const) {
     for (const fingerprint of selector.pick ?? []) {
-      if (!nodes.some((node) => node.fingerprint === fingerprint)) {
-        warnings.push(`${role}选择了未被主规则选中的节点 ${fingerprint}，请调整主规则的筛选或 limit`);
+      if (!roleNodes.some((node) => node.fingerprint === fingerprint)) {
+        warnings.push(`${role}选择的节点 ${fingerprint} 当前不存在或不可用`);
       }
     }
   }
 
-  const entries = selectNodes(nodes, rule.entry, warnings);
-  const landings = selectNodes(nodes, rule.landing, warnings);
+  const entries = selectNodes(roleNodes, rule.entry, warnings);
+  const landings = selectNodes(roleNodes, rule.landing, warnings);
   stats.entryCount = entries.length;
   stats.landingCount = landings.length;
   const maxPairs = Math.min(Math.max(rule.maxPairs ?? 200, 1), 1000);
@@ -150,7 +154,7 @@ export function expandChain(nodes: readonly ProxyNode[], rule: ChainRule | undef
   const uniqueDerived = ensureUniqueNames([...lockedEntries, ...derived]).slice(lockedEntries.length);
   const entryFingerprints = new Set(entries.map((node) => node.fingerprint));
   const direct = rule.keepLandingDirect === true
-    ? [...nodes]
+    ? [...nodes, ...landings.filter((landing) => !nodes.some((node) => node.fingerprint === landing.fingerprint))]
     : nodes.filter((node) => {
         if (!landings.some((landing) => landing.fingerprint === node.fingerprint)) return true;
         stats.removedDirectLanding++;

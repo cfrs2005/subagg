@@ -8,8 +8,10 @@ URL——这些一旦泄露，等同于把你的所有代理账号交给对方�
 
 本项目的设计前提是：
 
-- **单用户自托管。** 没有多用户体系，没有 RBAC。持有 `ADMIN_TOKEN` 的人拥有全部权限。
-- **管理端不应暴露公网。** 默认监听 `127.0.0.1`。
+- **单用户自托管。** 没有 RBAC。Google 登录只放行 `GOOGLE_ALLOWED_EMAILS` 里
+  精确列出的已验证邮箱，生产环境恰好一个。
+- **管理端只通过 HTTPS 反代访问。** 应用默认监听 `127.0.0.1`，生产不接受
+  `ADMIN_TOKEN` 作为登录方式。
 - **`/sub/:token` 端点必须暴露**（否则客户端拉不到订阅），但它只按 token 返回对应 profile
   的内容，且 token 可单独吊销。
 
@@ -33,9 +35,14 @@ URL——这些一旦泄露，等同于把你的所有代理账号交给对方�
    ```
 
    服务在 `ADMIN_TOKEN` 缺失或短于 16 字符时**拒绝启动**——本项目不提供默认口令，
-   也不允许"先跑起来再说"。
+   也不允许"先跑起来再说"。该值仍用于加密中转商凭据；生产管理登录不使用它。
 
-4. **保护 `.env` 与数据库文件权限。**
+4. **生产 Google 登录必须使用独立的 Web OAuth Client。** 精确注册
+   `https://你的域名/auth/google/callback`，并设置至少 32 字符的随机
+   `SESSION_SECRET`、`SESSION_COOKIE_SECURE=true`、`ALLOW_DEV_LOGIN=false`。
+   Client Secret 与 Session Secret 只放在受控环境文件或密钥存储中。
+
+5. **保护 `.env` 与数据库文件权限。**
 
    ```bash
    chmod 600 .env
@@ -43,7 +50,7 @@ URL——这些一旦泄露，等同于把你的所有代理账号交给对方�
 
    数据库文件由程序创建为 `0600`。
 
-5. **考虑把管理界面限制在内网或 VPN 后。** 反代层加一条来源 IP 白名单，或干脆只通过
+6. **考虑把管理界面限制在内网或 VPN 后。** 反代层加一条来源 IP 白名单，或干脆只通过
    SSH 隧道访问：
 
    ```bash
@@ -54,7 +61,12 @@ URL——这些一旦泄露，等同于把你的所有代理账号交给对方�
 
 | 措施 | 说明 |
 |------|------|
-| 管理 API 鉴权 | `/api/*` 全量要求 `Authorization: Bearer <ADMIN_TOKEN>`，比较使用**时间恒定**算法，避免计时侧信道 |
+| Google OIDC | 服务端 authorization-code + PKCE，校验 state、nonce、签名、issuer、audience、过期时间、稳定 `sub` 和已验证邮箱 |
+| 访问策略 | 未授权邮箱在创建本站账号和会话之前被拒绝；生产固定为 owner-only |
+| 应用会话 | 浏览器持有高熵不透明 Cookie，数据库只存带服务端 secret 的 HMAC；支持过期、退出和立即撤销 |
+| CSRF | 所有 cookie 认证的写请求都必须同时提交 CSRF Cookie 与请求头；服务端再校验保存的哈希 |
+| Cookie | 生产会话使用 `HttpOnly`、`Secure`、`SameSite=Lax` 和 host-only 作用域 |
+| 开发入口 | `ADMIN_TOKEN` Bearer 只在非生产且显式允许时可用，生产配置会拒绝启动 |
 | 订阅 token | 32 字节密码学随机，URL-safe base64，可单独吊销与轮换 |
 | 日志脱敏 | 订阅 URL、UUID、密码、token 在写日志前一律打码，不会出现在 journalctl 里 |
 | IP 不存明文 | 访问日志中的 IP 以 `HMAC-SHA256(salt, ip)` 存储，仅用于区分不同来源 |

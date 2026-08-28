@@ -54,7 +54,7 @@ export type SecretDecryptReason = 'bad-key' | 'unknown-version' | 'malformed' | 
  *
  * 存在的意义是让 services 层能 `catch` 得住并降级：轮换过 `ADMIN_TOKEN` 的
  * 库里，每个 IX provider 的凭据都解不开，此时正确行为是标记"需重新录入"
- * 并回落直连，不是让订阅请求 500。
+ * 并让关联 IX 节点不可用，不是让订阅请求 500。
  *
  * ⚠️ message 里**绝不能**出现明文、密钥或完整密文 —— 它会被打进日志。
  */

@@ -11,9 +11,9 @@
 import { describe, expect, it } from 'vitest';
 import { expandChain } from '../src/core/chain.js';
 import { emit } from '../src/core/emit/index.js';
-import { applyFilter, type FilterRule } from '../src/core/filter.js';
+import { applyFilter } from '../src/core/filter.js';
 import { computeFingerprint } from '../src/core/fingerprint.js';
-import { applyIx, ixRuleInteractionWarnings, type IxEntry } from '../src/core/ix.js';
+import { applyIx, buildIxRelayNode, type IxEntry } from '../src/core/ix.js';
 import type {
   Hysteria2Node,
   ProxyNode,
@@ -689,49 +689,63 @@ describe('J 纯度：输入数组与输入节点（含嵌套对象）都不被�
   });
 });
 
-// ─────────────────────────────────────────────────────────────
-//  规则层面的交互隐患
-// ─────────────────────────────────────────────────────────────
-
-describe('ixRuleInteractionWarnings', () => {
-  const base: FilterRule = { ix: { enabled: true } };
-
-  it('ix 没开时什么都不报', () => {
-    expect(ixRuleInteractionWarnings({ rename: [{ replace: '{server}' }] })).toEqual([]);
-    expect(ixRuleInteractionWarnings({ ix: { enabled: false }, rename: [{ replace: '{server}' }] })).toEqual([]);
-  });
-
-  it('rename 模板含 {server} / {port} 时报出来（会把落地域名印在节点名上）', () => {
-    const w = ixRuleInteractionWarnings({ ...base, rename: [{ replace: '{server}:{port}' }] });
-    expect(w).toHaveLength(1);
-    expect(w[0]).toContain('{server}');
-    expect(ixRuleInteractionWarnings({ ...base, rename: [{ replace: '{flag} {index2}' }] })).toEqual([]);
-  });
-
-  it('链式选择器用 field:"server" 时报出来（它看到的是入口地址）', () => {
-    const w = ixRuleInteractionWarnings({
-      ...base,
-      chain: {
-        enabled: true,
-        entry: { include: [{ field: 'server', op: 'contains', value: 'hk' }] },
-        landing: { pick: ['x'] },
-      },
+describe('buildIxRelayNode', () => {
+  it('生成稳定 IX 身份，入口更新不改变指纹，协议凭据与握手字段保持不变', () => {
+    const origin = trojan({
+      name: 'bwg-ssr',
+      tls: { enabled: true },
+      transport: { network: 'ws', ws: { path: '/relay' } },
     });
-    expect(w.join(' ')).toContain('field:"server"');
+    const first = buildIxRelayNode(origin, { id: 'provider-a', name: 'IX A' }, entry());
+    const second = buildIxRelayNode(
+      origin,
+      { id: 'provider-a', name: 'IX A' },
+      entry({ entryHost: 'new-entry.example', entryPort: 53001 }),
+    );
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    if (!first.ok || !second.ok) return;
+    expect(first.node.name).toBe('IX_bwg-ssr');
+    expect(first.node.fingerprint).toBe(second.node.fingerprint);
+    expect(first.node.fingerprint).not.toBe(origin.fingerprint);
+    expect(first.node.server).toBe(ENTRY_HOST);
+    expect(second.node.server).toBe('new-entry.example');
+    expect(first.node.type).toBe('trojan');
+    if (first.node.type !== 'trojan' || origin.type !== 'trojan') return;
+    expect(first.node.password).toBe(origin.password);
+    expect(first.node.transport).toMatchObject({ network: 'ws', ws: { path: '/relay' } });
+    expect(first.node.tls.sni).toBe(origin.server);
+    expect(first.node.ix).toMatchObject({
+      providerId: 'provider-a',
+      originFingerprint: origin.fingerprint,
+      originServer: origin.server,
+    });
   });
 
-  it('keepLandingDirect 与中转不可同时表达，必须说清', () => {
-    const w = ixRuleInteractionWarnings({
-      ...base,
-      chain: { enabled: true, entry: { pick: ['a'] }, landing: { pick: ['b'] }, keepLandingDirect: true },
+  it('VLESS 与 SSR 派生节点保留原协议身份字段', () => {
+    const vl = vless({ name: 'bwg-vless' });
+    const sr = ssr({ name: 'bwg-ssr', obfsParam: 'cdn.example' });
+    const vlRelay = buildIxRelayNode(vl, { id: 'provider-a', name: 'IX A' }, entry());
+    const srRelay = buildIxRelayNode(sr, { id: 'provider-a', name: 'IX A' }, entry());
+    expect(vlRelay.ok).toBe(true);
+    expect(srRelay.ok).toBe(true);
+    if (!vlRelay.ok || !srRelay.ok) return;
+    expect(vlRelay.node).toMatchObject({
+      type: 'vless',
+      name: 'IX_bwg-vless',
+      server: ENTRY_HOST,
+      uuid: '22222222-2222-2222-2222-222222222222',
     });
-    expect(w.join(' ')).toContain('keepLandingDirect');
-    // chain 没启用时它是惰性的，不该刷屏
-    expect(
-      ixRuleInteractionWarnings({
-        ...base,
-        chain: { enabled: false, entry: { pick: ['a'] }, landing: { pick: ['b'] }, keepLandingDirect: true },
-      }),
-    ).toEqual([]);
+    expect(srRelay.node).toMatchObject({
+      type: 'ssr',
+      name: 'IX_bwg-ssr',
+      server: ENTRY_HOST,
+      cipher: 'aes-256-cfb',
+      password: 'pw-ssr',
+      protocol: 'auth_aes128_md5',
+      obfs: 'plain',
+      obfsParam: 'cdn.example',
+    });
   });
 });

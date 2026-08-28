@@ -30,10 +30,12 @@
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
+    "@fastify/cookie": "^11.0.2",
     "@fastify/rate-limit": "^10.2.0",
-    "@fastify/static": "^8.0.4",
+    "@fastify/static": "^10.1.3",
     "better-sqlite3": "^11.7.0",
     "fastify": "^5.2.0",
+    "openid-client": "^6.8.7",
     "yaml": "^2.6.1",
     "zod": "^3.24.1"
   },

@@ -104,6 +104,14 @@ export function deriveChainFingerprint(landingFp: string, entryFp: string): stri
   return createHash('sha1').update([landingFp, 'via', entryFp].join('\x1f')).digest('hex').slice(0, FINGERPRINT_LENGTH);
 }
 
+/** Derive a stable identity for an IX relay independently of its mutable entry address. */
+export function deriveIxRelayFingerprint(providerId: string, originFingerprint: string): string {
+  return createHash('sha1')
+    .update(['ix-relay', providerId, originFingerprint].join('\x1f'))
+    .digest('hex')
+    .slice(0, FINGERPRINT_LENGTH);
+}
+
 /**
  * 把解析器产出的半成品补齐为完整节点：规范化主机名、计算指纹、绑定来源信息。
  *

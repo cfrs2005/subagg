@@ -222,19 +222,6 @@ export function createSubRoutes(ctx: AppContext): FastifyPluginAsync {
         reply.header('x-subagg-nodes', String(result.nodeCount));
         reply.header('x-subagg-target', `${result.target} (${result.targetSource})`);
         if (result.chain) reply.header('x-subagg-chain', String(result.chain.pairCount));
-        if (result.ix) {
-          // 三个数字回答"我的节点走中转了吗"：改写了几个、几个回落成直连、几个被丢弃。
-          // 全 ASCII，不必编码；键名与值都写成自描述形式，免得 curl -I 看到一串裸数字
-          reply.header(
-            'x-subagg-ix',
-            `rewritten=${result.ix.rewritten}; direct=${result.ix.unchanged}; dropped=${result.ix.dropped}`,
-          );
-          const first = result.ixSkipped?.[0];
-          // 只放第一条原因码，理由同 x-subagg-skipped-reason：同一批跳过的原因
-          // 通常相同，而头部长度有限 —— 中文 detail 百分号编码后一条就能吃掉 1KB。
-          // 逐条原因在界面上看（RenderResult.ixSkipped）。
-          if (first) reply.header('x-subagg-ix-reason', toHeaderValue(first.reason));
-        }
         if (result.skipped.length > 0) {
           reply.header('x-subagg-skipped', String(result.skipped.length));
           // 只放第一条原因：同一批被跳过的节点原因通常相同，
@@ -256,9 +243,6 @@ export function createSubRoutes(ctx: AppContext): FastifyPluginAsync {
           nodeCount: result.nodeCount,
           skipped: result.skipped.length,
           bytes,
-          // 只在 IX 真的跑了时才记这两个字段：常态部署里它俩恒为 0，
-          // 白记只会让每条日志变长
-          ...(result.ix ? { ixRewritten: result.ix.rewritten, ixDirect: result.ix.unchanged } : {}),
         });
 
         return reply.send(result.body);

@@ -12,7 +12,7 @@
  * 必须在**本插件内**再挂一次 —— 少了这一句，九个 IX 路由会全部变成**公开**接口，
  * 而"能读能写中转商凭据状态、能删远端端口"的接口公开出去等于全盘失守。
  * （同一条机制也是 `app.ts` 里 `setErrorHandler` 必须先注册的原因。）
- * `test/ix-routes.test.ts` 的「九个路由无 Bearer 一律 401」就是这条的绊线。
+ * `test/ix-routes.test.ts` 的「十一个路由无 Bearer 一律 401」就是这条的绊线。
  *
  * ## 这一组的通用取舍
  *
@@ -91,6 +91,11 @@ const EnsureIxMappingsSchema = z.object({
   fingerprints: z.array(z.string().min(1).max(128)).min(1).max(IX_MAX_FINGERPRINTS),
 });
 
+const CreateIxRelaysSchema = z.object({
+  providerId: z.string().min(1).max(64),
+  sourceFingerprints: z.array(z.string().min(1).max(128)).min(1).max(IX_MAX_FINGERPRINTS),
+});
+
 const IxRefreshSchema = z.object({
   providerId: z.string().min(1).max(64).optional(),
 });
@@ -146,7 +151,7 @@ type ProviderPick = { ok: true; id: string } | { ok: false; reason: string };
 export function createIxRoutes(ctx: AppContext): FastifyPluginAsync {
   return async function ixRoutes(app: FastifyInstance): Promise<void> {
     // 见文件头：hook 按封装上下文生效，admin 插件那句挂不到这里。删掉这行 =
-    // 九个 IX 路由全部公开。
+    // 十一个 IX 路由全部公开。
     app.addHook('preHandler', requireAdmin(ctx));
 
     // ── IX 凭据的加解密（只在本文件内部用，明文绝不出门）──────
@@ -178,7 +183,7 @@ export function createIxRoutes(ctx: AppContext): FastifyPluginAsync {
         return { has: true, broken: false };
       } catch {
         // 轮换过 ADMIN_TOKEN 的库里每个 provider 都会走到这里 —— 预期状态，不是异常。
-        // 界面据此提示"需重新录入"，服务本身回落直连、不崩。
+        // 界面据此提示"需重新录入"，关联 IX 节点不可用，服务本身不崩。
         return { has: true, broken: true };
       }
     };
@@ -298,28 +303,22 @@ export function createIxRoutes(ctx: AppContext): FastifyPluginAsync {
     });
 
     app.delete<{ Params: { id: string } }>('/providers/:id', async (req, reply) => {
-      // 先数一遍映射：删 provider 会连带删掉本地映射（ON DELETE CASCADE），
-      // 而远端端口**不会**被删（用户决策：只标记、不自动删）。不说清楚的话
-      // 这些端口会永远占着线路配额，而界面上再也看不到它们。
-      const orphaned = ctx.ixMappings.count(req.params.id);
+      const relayCount = ctx.ixMappings.count(req.params.id);
+      if (relayCount > 0) {
+        return reply.code(409).send({
+          error: `该中转商仍有 ${relayCount} 个 IX 节点。请先在节点列表删除它们，再删除中转商。`,
+          deleted: false,
+        });
+      }
       const deleted = ctx.ixProviders.delete(req.params.id);
       if (!deleted) return reply.code(404).send({ error: '中转商不存在', deleted: false });
 
       ctx.logger.info('IX：中转商已删除', {
         endpoint: 'DELETE /api/ix/providers/:id',
         providerRef: ixRef(req.params.id),
-        droppedMappings: orphaned,
+        droppedMappings: 0,
       });
-      return {
-        deleted: true,
-        ...(orphaned > 0
-          ? {
-              warning:
-                `已删除 ${orphaned} 条本地映射，但中转平台上对应的转发端口**没有**被删除，` +
-                '仍在占用线路配额。下一步：到中转平台手动清理这些端口。',
-            }
-          : {}),
-      };
+      return { deleted: true };
     });
 
     app.post<{ Params: { id: string } }>('/providers/:id/probe', async (req, reply) => {
@@ -392,6 +391,8 @@ export function createIxRoutes(ctx: AppContext): FastifyPluginAsync {
         remotePortId: item.remotePortId,
         entryHost: item.entryHost,
         entryPort: item.entryPort,
+        relayFingerprint: item.relayFingerprint,
+        relayName: item.relayName,
         reason: item.detail,
       }));
 
@@ -410,6 +411,59 @@ export function createIxRoutes(ctx: AppContext): FastifyPluginAsync {
         failed: results.filter((r) => r.outcome === 'failed').length,
       });
       return { results, warnings: result.warnings };
+    });
+
+    app.post('/relays', async (req, reply) => {
+      const parsed = CreateIxRelaysSchema.safeParse(req.body);
+      if (!parsed.success) return reply.code(400).send(badRequest(parsed.error.issues));
+      const provider = ctx.ixProviders.get(parsed.data.providerId);
+      if (!provider) {
+        return reply.code(404).send({ error: '中转商不存在' });
+      }
+      if (!provider.enabled) {
+        return reply.code(409).send({ error: '该 IX 通道已关闭，请先启用后再生成节点。' });
+      }
+
+      const result = await ctx.ix.ensureMappings(parsed.data.providerId, parsed.data.sourceFingerprints);
+      const relays = result.items.map((item) => ({
+        sourceFingerprint: item.fingerprint,
+        relayFingerprint: item.relayFingerprint,
+        relayName: item.relayName,
+        outcome: item.outcome,
+        remotePortId: item.remotePortId,
+        entryHost: item.entryHost,
+        entryPort: item.entryPort,
+        reason: item.detail,
+      }));
+      if (result.error !== undefined) {
+        return reply.code(400).send({ error: result.error, relays, warnings: result.warnings });
+      }
+      ctx.logger.info('IX：批量生成派生节点', {
+        endpoint: 'POST /api/ix/relays',
+        providerRef: ixRef(parsed.data.providerId),
+        requested: parsed.data.sourceFingerprints.length,
+        created: relays.filter((relay) => relay.outcome === 'created').length,
+        claimed: relays.filter((relay) => relay.outcome === 'claimed').length,
+        failed: relays.filter((relay) => relay.outcome === 'failed').length,
+      });
+      return reply.code(201).send({ relays, warnings: result.warnings });
+    });
+
+    app.delete<{ Params: { relayFingerprint: string } }>('/relays/:relayFingerprint', async (req, reply) => {
+      const result = await ctx.ix.removeRelay(req.params.relayFingerprint);
+      if (!result.ok) {
+        return reply.code(result.error?.includes('不存在') ? 404 : 409).send({
+          error: result.error ?? 'IX 节点删除失败',
+          removed: false,
+          remoteDeleted: false,
+          warnings: result.warnings,
+        });
+      }
+      return {
+        removed: result.removedLocal,
+        remoteDeleted: result.remoteDeleted,
+        warnings: result.warnings,
+      };
     });
 
     app.delete<{

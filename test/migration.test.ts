@@ -18,7 +18,7 @@ describe('database migrations', () => {
     expect(columns.map((column) => column.name)).toEqual(expect.arrayContaining(['max_access', 'quota_window_hours', 'source_limit']));
     expect((db.prepare('SELECT COUNT(*) AS n FROM tokens').get() as { n: number }).n).toBe(before.n);
     expect(db.prepare('SELECT max_access, quota_window_hours, source_limit FROM tokens WHERE token = ?').get('legacy')).toEqual({ max_access: null, quota_window_hours: null, source_limit: null });
-    expect((db.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get() as { n: number }).n).toBe(5);
+    expect((db.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get() as { n: number }).n).toBe(MIGRATIONS.length);
     const pingTable = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'node_ping_history'").get();
     expect(pingTable).toBeTruthy();
     // v5 的端口级 UDP 能力列：必须可空，NULL 表示"还没同步过、事实未知"。
@@ -33,7 +33,7 @@ describe('database migrations', () => {
     expect(entryUdp?.notnull).toBe(0);
     expect(entryUdp?.dflt_value).toBeNull();
     migrate(db, logger, MIGRATIONS);
-    expect((db.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get() as { n: number }).n).toBe(5);
+    expect((db.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get() as { n: number }).n).toBe(MIGRATIONS.length);
     db.close();
   });
 });

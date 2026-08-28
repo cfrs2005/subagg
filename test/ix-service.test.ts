@@ -197,7 +197,7 @@ let nodes: NodeRepo;
 let client: FakeClient;
 
 function makeConfig(over: Partial<Config> = {}): Config {
-  return { ixTimeoutMs: 15_000, ixOrphanThreshold: 5, ixSyncIntervalHours: 6, ...over } as Config;
+  return { ixTimeoutMs: 15_000, ixOrphanThreshold: 5, ixSyncIntervalMinutes: 5, ...over } as Config;
 }
 
 function makeService(config: Config = makeConfig(), key: Buffer = KEY): IxService {
@@ -402,7 +402,10 @@ describe('ensureMappings', () => {
       remotePortId: 230,
       entryHost: ENTRY_HOST,
       entryPort: 51_221,
+      relayName: 'IX_A',
     });
+    expect(result.items[0]?.relayFingerprint).toHaveLength(16);
+    expect(result.items[0]?.relayFingerprint).not.toBe(node.fingerprint);
     // 30 个配额浪费不起：认领链路上多发一个 create 就是白烧一个
     expect(client.created()).toEqual([]);
 
@@ -571,6 +574,26 @@ describe('ensureMappings', () => {
     expect(result.error).toContain('999');
     expect(client.created()).toEqual([]);
   });
+
+  it('协议安全检查失败时不创建远端端口，也不写失败映射', async () => {
+    const provider = makeProvider();
+    const node = makeNode({
+      type: 'ss',
+      name: 'unsafe-obfs',
+      server: 'a.example.com',
+      port: 443,
+      cipher: 'aes-128-gcm',
+      password: 'pw',
+      plugin: { name: 'obfs-local', opts: { obfs: 'http' } },
+    });
+    seed(node);
+
+    const result = await makeService().ensureMappings(provider.id, [node.fingerprint]);
+    expect(result.items[0]).toMatchObject({ outcome: 'failed' });
+    expect(result.items[0]?.detail).toContain('未调用 IX 创建接口');
+    expect(client.created()).toEqual([]);
+    expect(mappings.get(provider.id, node.fingerprint)).toBeUndefined();
+  });
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -630,6 +653,48 @@ describe('refresh', () => {
     });
   });
 
+  it('批量入口域名更新后所有 IX 派生节点刷新地址且稳定指纹不变', async () => {
+    const provider = makeProvider();
+    const a = ssNode('A', 'a.example.com', 443);
+    const b = ssNode('B', 'b.example.com', 8443);
+    seed(a, b);
+    const service = makeService();
+    await service.ensureMappings(provider.id, [a.fingerprint, b.fingerprint]);
+    const before = new Map(service.relayViews().map((relay) => [relay.originFingerprint, relay.fingerprint]));
+
+    client.ports = client.ports.map((port, index) => ({
+      ...port,
+      ip_addr: 'new-batch-entry.example',
+      port_v4: 53_000 + index,
+    }));
+    const result = await service.refresh(provider.id);
+    expect(result).toMatchObject({ ok: true, checked: 2, updated: 2 });
+    const after = service.relayViews();
+    expect(after.map((relay) => relay.server)).toEqual(['new-batch-entry.example', 'new-batch-entry.example']);
+    for (const relay of after) {
+      expect(relay.fingerprint).toBe(before.get(relay.originFingerprint));
+    }
+  });
+
+  it('控制面同步失败时保留最后入口并标记 stale，不改成原始直连', async () => {
+    const provider = makeProvider();
+    const node = ssNode('A', 'a.example.com', 443);
+    seed(node);
+    const service = makeService();
+    await service.ensureMappings(provider.id, [node.fingerprint]);
+    client.listAllPorts = async () => {
+      throw new IxApiError('zf 返回 HTTP 502：网关错误', true, 502);
+    };
+
+    const result = await service.refresh(provider.id);
+    expect(result.ok).toBe(false);
+    expect(service.relayViews()[0]).toMatchObject({
+      relayState: 'stale',
+      server: ENTRY_HOST,
+      node: expect.objectContaining({ server: ENTRY_HOST }),
+    });
+  });
+
   it('远端端口消失 → state=error 且给可读原因，绝不删本地映射', async () => {
     const provider = makeProvider();
     const node = ssNode('A', 'a.example.com', 443);
@@ -645,7 +710,7 @@ describe('refresh', () => {
     expect(mapping.state).toBe('error');
     expect(mapping.lastError).toContain('远端已经没有');
     expect(mapping.lastError).toContain('下一步');
-    // state=error → core 拿到 'unknown'，会保守回落直连
+    // state=error → core 拿到 'unknown'，派生目录会把 IX 节点标为不可用
     expect(service.entriesFor(provider.id).get(node.fingerprint)?.status).toBe('unknown');
   });
 
@@ -758,11 +823,31 @@ describe('refresh', () => {
     expect(service.entriesFor(provider.id).get(node.fingerprint)?.udp).toBeUndefined();
   });
 
-  it('没有映射时不发任何出站请求', async () => {
+  it('没有映射时仍读取远端端口，用于首次自动发现', async () => {
     const provider = makeProvider();
     const result = await makeService().refresh(provider.id);
-    expect(result).toMatchObject({ ok: true, checked: 0 });
-    expect(client.calls).toEqual([]);
+    expect(result).toMatchObject({ ok: true, checked: 0, discovered: 0 });
+    expect(client.calls).toEqual(['listAllPorts']);
+  });
+
+  it('首次同步自动认领与原节点目标精确匹配的远端端口，不调用 createPort', async () => {
+    const provider = makeProvider();
+    const node = ssNode('BWG-ss2022', 'bwg.example.com', 2002);
+    seed(node);
+    client.ports = [makePort('bwg.example.com:2002', { id: 230, port_v4: 51_221 })];
+
+    const service = makeService();
+    const result = await service.refresh(provider.id);
+
+    expect(result).toMatchObject({ ok: true, checked: 1, discovered: 1, updated: 1 });
+    expect(client.created()).toEqual([]);
+    expect(mappings.get(provider.id, node.fingerprint)).toMatchObject({
+      remotePortId: 230,
+      entryHost: ENTRY_HOST,
+      entryPort: 51_221,
+      state: 'active',
+    });
+    expect(service.relayViews()[0]).toMatchObject({ name: 'IX_BWG-ss2022', relayState: 'active' });
   });
 });
 
@@ -823,6 +908,33 @@ describe('removeMapping', () => {
     const mapping = mappings.get(provider.id, node.fingerprint)!;
     expect(mapping.state).toBe('error');
     expect(mapping.lastError).toContain('本地映射已保留');
+  });
+
+  it('共享同一远端端口时只删当前 IX 节点，最后一个引用才删远端', async () => {
+    const provider = makeProvider();
+    const a = ssNode('A', 'shared.example.com', 443);
+    const b = makeNode({
+      type: 'ss',
+      name: 'B',
+      server: 'shared.example.com',
+      port: 443,
+      cipher: 'aes-128-gcm',
+      password: 'different-password',
+    });
+    seed(a, b);
+    const service = makeService();
+    await service.ensureMappings(provider.id, [a.fingerprint, b.fingerprint]);
+    expect(mappings.listByRemotePort(provider.id, client.ports[0]!.id)).toHaveLength(2);
+
+    const first = await service.removeMapping(provider.id, a.fingerprint, { deleteRemote: true });
+    expect(first).toMatchObject({ ok: true, removedLocal: true, remoteDeleted: false });
+    expect(first.warnings.join(' ')).toContain('另外 1 个 IX 节点');
+    expect(client.ports).toHaveLength(1);
+    expect(mappings.get(provider.id, b.fingerprint)).toBeDefined();
+
+    const second = await service.removeMapping(provider.id, b.fingerprint, { deleteRemote: true });
+    expect(second).toMatchObject({ ok: true, removedLocal: true, remoteDeleted: true });
+    expect(client.ports).toEqual([]);
   });
 
   it('映射不存在时返回可读原因而不是假装删掉了', async () => {

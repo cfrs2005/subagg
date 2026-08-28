@@ -10,16 +10,29 @@
     if (localStorage.getItem('subagg.theme') === 'dark') document.documentElement.dataset.theme = 'dark';
   } catch (_) { /* Private browsing may reject localStorage. */ }
 </script>
-<link rel="stylesheet" href="./style.css?v=20260826-ixudp">
+<link rel="stylesheet" href="./style.css?v=20260827-ui-pass">
 </head>
 <body>
 <div class="gate" id="gate">
   <div class="gate-box">
-    <div class="gate-title">subagg</div>
-    <div class="gate-sub">请输入管理 Token（部署时设置的 <code>ADMIN_TOKEN</code>）。<br>它只保存在当前浏览器中。</div>
-    <input class="input" type="password" id="gateToken" placeholder="ADMIN_TOKEN" autocomplete="current-password">
+    <div class="gate-brand">
+      <span class="gate-brand-mark" aria-hidden="true">◇</span>
+      <div><span class="gate-kicker">私人工作台</span><h1 class="gate-title">subagg</h1></div>
+    </div>
+    <div class="gate-sub">使用已授权的 Google 账号进入订阅管理后台。</div>
+    <div class="gate-access"><i></i>仅授权账号可访问</div>
+    <a class="google-login" id="googleLogin" href="/auth/google/start">
+      <img src="/google-g.svg" alt="">
+      <span>使用 Google 登录</span>
+    </a>
     <div class="gate-err" id="gateErr"></div>
-    <div class="modal-actions"><button class="btn-pri" id="gateSubmit">进入管理台</button></div>
+    <div class="dev-login" id="devLogin" hidden>
+      <strong>仅限本地开发</strong>
+      <p>生产环境不会显示或接受此入口。</p>
+      <input class="input" type="password" id="devToken" placeholder="ADMIN_TOKEN" autocomplete="current-password">
+      <button class="btn-sec" id="devLoginSubmit">使用开发 Token</button>
+    </div>
+    <div class="gate-links"><a href="/privacy">隐私政策</a><span>·</span><a href="/terms">服务条款</a></div>
   </div>
 </div>
 
@@ -47,7 +60,7 @@
   <main class="main">
     <header class="topbar">
       <div class="page-context"><span class="context-icon">⌘</span><div><h1 id="pageTitle">节点管理</h1><p id="pageSubtitle">管理智能节点，支持多种协议和地区</p></div></div>
-      <div class="topbar-actions"><span class="system-health"><i></i>系统运行正常</span><span class="last-sync" id="lastSync"></span><button class="icon-btn" id="themeBtn" title="切换主题">◐</button><button class="icon-btn" id="logoutBtn" title="退出管理">⏻</button><span class="user-pill"><b>A</b><span>admin</span><span>⌄</span></span></div>
+      <div class="topbar-actions"><span class="system-health"><i></i>系统运行正常</span><span class="last-sync" id="lastSync"></span><button class="icon-btn" id="themeBtn" title="切换主题">◐</button><button class="icon-btn" id="logoutBtn" title="退出登录">⏻</button><span class="user-pill"><b id="userAvatar">G</b><span><strong id="userName">Google user</strong><small id="userEmail"></small></span></span></div>
     </header>
     <div class="tabs" aria-label="主导航">
       <button class="tab active" data-tab="nodes">节点列表</button>
@@ -75,6 +88,6 @@
 
 <div class="overlay" id="overlay"><div class="modal" id="modal"></div></div>
 <div class="toasts" id="toasts"></div>
-<script type="module" src="./app.js?v=20260826-ixudp"></script>
+<script type="module" src="./app.js?v=20260826-chain-name"></script>
 </body>
 </html>

@@ -70,8 +70,8 @@ at a nearby relay entry rather than at your provider directly. See
   forwarding ports on a layer-4 relay platform and serve the relay entry address
   instead of the landing server. **Only `server` and `port` are rewritten**; UUID,
   password, TLS, SNI, Host, path and every other protocol parameter stay byte for
-  byte identical. Per-profile switch plus a global kill switch, and any node whose
-  mapping isn't usable falls back to a direct connection with a readable reason.
+  byte identical. Original and `IX_` relay nodes coexist; unusable relays remain
+  visible with a readable state but are never disguised as direct nodes.
 
 ## Screenshots
 
@@ -106,13 +106,27 @@ npm run build
 npm start
 ```
 
-Open <http://127.0.0.1:8787>, paste your `ADMIN_TOKEN`, add a subscription.
+Open <http://127.0.0.1:8787>. The separate local-development panel accepts
+`ADMIN_TOKEN`; this fallback is rejected in production.
+
+For production Google login, create a dedicated Google Web OAuth Client and set
+`APP_ENV=production`, `PUBLIC_BASE_URL` / `WEB_APP_URL`, `GOOGLE_CLIENT_ID`,
+`GOOGLE_CLIENT_SECRET`, `SESSION_SECRET`, `SESSION_COOKIE_SECURE=true`, and
+`ALLOW_DEV_LOGIN=false`. Register this exact callback:
+
+```text
+https://your-host/auth/google/callback
+```
+
+The server accepts only the verified addresses listed in `GOOGLE_ALLOWED_EMAILS`;
+production takes exactly one (single-user self-hosting). Google tokens are discarded
+after the login callback — the application stores only its own revocable, hashed session.
 
 For development use `npm run dev` (watch mode via tsx).
 
 > **Before exposing this to the internet, read [SECURITY.md](./SECURITY.md).**
-> The database holds your proxy credentials. It needs HTTPS, and the admin API
-> should not be publicly reachable.
+> The database holds your proxy credentials. It needs HTTPS, and every admin API
+> request must be protected by the Google application session.
 
 Deployment: a [systemd unit](./scripts/subagg.service) for plain VPS installs,
 and a [Dockerfile](./Dockerfile) / [compose file](./docker-compose.yml) if you
@@ -142,13 +156,11 @@ Response headers worth knowing:
 | `X-Subagg-Nodes` | How many nodes went into the config |
 | `X-Subagg-Target` | Which format was chosen, and why (`ua` / `query` / `default`) |
 | `X-Subagg-Skipped` | How many nodes the target format can't represent |
-| `X-Subagg-IX` | Relay rewriting, when enabled: `rewritten=N; direct=N; dropped=N` |
-| `X-Subagg-IX-Reason` | Reason code for the first node that was *not* rewritten |
 | `X-Subagg-Warning` | Anything else you should know |
 
 ## IX relay orchestration
 
-Optional, and off until you switch it on for a specific profile.
+Optional. You create explicit IX relay nodes and then use them like ordinary nodes.
 
 The problem it solves is **link quality**, not reachability: the hop from your
 device to your provider's landing server is not something you control (it may
@@ -161,12 +173,12 @@ client ──▶ IX entry (nearby) ──▶ original landing server
 ```
 
 Layer 4 means the relay never terminates TLS and never inspects the payload.
-So subagg rewrites **only the dial-out address** — `server` and `port`. UUID,
+Each IX relay node changes **only the dial-out address** — `server` and `port`. UUID,
 password, cipher, TLS, SNI, ALPN, REALITY, Host, path, gRPC service name, flow:
-all untouched, byte for byte identical to the direct version. The rewrite
-happens while the subscription is being rendered and is **never written to the
-database**; the node in your library always keeps its original address, so your
-manual picks, ping history and mappings survive.
+all remain identical to the original version. The mapping is stored once and the
+relay node is projected into the node catalog as `IX_<original name>`. Its stable
+fingerprint is derived from provider + original fingerprint, so entry hostname and
+port changes do not invalidate profile picks or latency history.
 
 One consequence of that is worth knowing, because it is where handshakes live or
 die. `server` quietly doubles as "who do we handshake with" in four places —
@@ -183,14 +195,14 @@ invisibly.
 1. **Add a provider** — the "IX 中转" tab → *添加中转商*. You need the API base
    URL (e.g. `https://<platform-host>/api`) and credentials.
 2. **Test connection** — pulls the line list, per-line port quota, traffic, expiry
-   and, explicitly, a list of what your account *cannot* do.
-3. **Create the forwarding ports** — node table → tick the nodes you want →
-   *建立 IX 转发* (50 fingerprints per batch, at most). If the platform already
+   and, explicitly, a list of what your account *cannot* do. **Sync status** then
+   auto-discovers existing remote ports whose targets exactly match local nodes.
+3. **Generate IX nodes** — node table → tick the original nodes →
+   *生成 IX 节点* (50 fingerprints per batch, at most). If the platform already
    has a port pointing at the same `host:port`, subagg **claims** it rather than
    creating a duplicate — quotas are small enough that this matters.
-4. **Enable it on a profile** — profile editor → the "IX 中转" panel → on. Only
-   profiles with that switch on get rewritten; everything else keeps serving
-   direct addresses.
+4. **Pick the generated nodes** — `IX_...` rows appear next to the originals and
+   can be selected directly in a profile. There is no profile-level IX switch.
 
 ### Authentication
 
@@ -223,8 +235,8 @@ Two modes, both first-class:
   platform has them switched off, subagg only ever uses plain direct forwarding —
   and the connection test spells out which of them you don't have.
 - **Some nodes are deliberately refused.** Where the address change would force
-  subagg to guess a disguise parameter, it declines to rewrite and leaves the node
-  direct: REALITY without an explicit `sni`, Shadowsocks with an obfuscation
+  subagg to guess a disguise parameter, it refuses creation before consuming a
+  remote port: REALITY without an explicit `sni`, Shadowsocks with an obfuscation
   plugin, ShadowsocksR obfuscation that needs a host, plaintext gRPC, and
   UDP-native protocols (Hysteria2 / TUIC / QUIC) behind a port that doesn't forward
   UDP. Every one of them reports why, and what to do instead.
@@ -235,25 +247,20 @@ Two modes, both first-class:
 
 ### When something breaks
 
-Two switches, in increasing order of bluntness:
+Rendering a subscription **makes zero outbound requests**. A control-plane sync
+failure keeps the last known IX entry and marks the node stale. A suspended,
+expired or otherwise unusable port stays visible as unavailable and is omitted from
+subscriptions; it never turns into a direct node while keeping an `IX_` name. The
+original node remains beside it for an explicit manual fallback.
 
-- **Per profile** — turn the profile's IX switch off, refetch, and that
-  subscription is back on direct addresses immediately.
-- **Global kill switch** — turn a provider's master switch off and *every* profile
-  falls back to direct at once. This is the thing to reach for at 3am.
-
-You never have to reach for either just because the platform is down. Rendering a
-subscription **makes zero outbound requests** — it only reads the local mapping
-table — so the relay platform being unreachable, rate-limited or expired does not
-stop subscriptions from being served. Mappings that aren't usable simply fall back
-to direct, and the reason comes back in `X-Subagg-IX` / `X-Subagg-IX-Reason` and
-in the UI, per node.
+Deleting an IX node deletes the remote port when it is the last local reference,
+then reads the platform state back before removing the local mapping. A provider
+cannot be deleted while it still has IX nodes.
 
 ### Two different latencies — do not add them up
 
-- The latency in the **node table** is measured by subagg: *this host → the
-  original landing server, directly*. It is a TCP connect against the address in
-  the database, which is always the original one.
+- The latency in the **node table** is measured by subagg against the address shown
+  in that row: original rows test the landing server; `IX_` rows test the IX entry.
 - The latency on an **IX mapping** is measured by the relay platform: *relay entry
   → original landing server*.
 
@@ -277,14 +284,14 @@ file" to "get the file *and* the environment".
 The cost is unavoidable and you should plan for it: **rotating `ADMIN_TOKEN`
 makes already-stored credentials permanently undecryptable.** That is arithmetic,
 not a bug. subagg handles it gracefully — the provider is flagged as needing
-re-entry, affected profiles fall back to direct, nothing crashes — but you will
+  re-entry, affected IX nodes become unavailable, nothing crashes — but you will
 have to type the credentials in again.
 
 ### Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `IX_SYNC_INTERVAL_HOURS` | `6` | How often to reconcile local mappings with the platform. **`0` disables the background sync**, which only stops status from refreshing — subscriptions keep being served either way. Max 168. |
+| `IX_SYNC_INTERVAL_MINUTES` | `5` | How often to reconcile local mappings and refresh projected IX node addresses. **`0` disables background sync**. Max 1440. |
 | `IX_TIMEOUT_MS` | `15000` | Per-request timeout for platform API calls. It's an external service; it must not be able to stall the scheduler. Range 1000–120000. |
 | `IX_ORPHAN_THRESHOLD` | `5` | How many consecutive syncs a node may be missing from every subscription before its mapping is flagged an orphan. Deliberately not `1`: upstreams return incomplete lists often enough that one miss means nothing. Orphans are **flagged only** — no remote port is ever deleted automatically. Range 1–100. |
 
@@ -319,7 +326,7 @@ would be fabricated. For real numbers, check your provider's dashboard.
 src/core/       pure functions — no IO, fully unit-tested
   parse/        subscription formats → one node model
   filter.ts     the rule engine
-  ix.ts         relay rewriting — swaps the dial-out address, nothing else
+  ix.ts         relay projection — swaps the dial-out address, nothing else
   secret.ts     AES-256-GCM sealing for stored credentials
   emit/         node model → client formats, plus the capability matrix
 src/db/         SQLite persistence
@@ -328,9 +335,8 @@ src/server/     HTTP: /sub/:token (public) and /api/* (authenticated)
 public/         zero-build frontend — plain ES modules, no bundler
 ```
 
-The render pipeline is `filter → ix → chain → emit`, and that order is load
-bearing rather than incidental — see `src/core/ix.ts`, which explains why in its
-header comment.
+The node catalog projects `original + IX relay` nodes first. Profiles then use the
+normal `filter → chain → emit` pipeline for both kinds.
 
 The `core/` layer is deliberately IO-free. Protocol parsing and config generation
 are where the bugs live, and keeping side effects out means every branch is

@@ -66,8 +66,20 @@ function loadDotenv(path = '.env'): void {
 // ─────────────────────────────────────────────────────────────
 
 const MIN_SECRET_LENGTH = 16;
+const MIN_SESSION_SECRET_LENGTH = 32;
+
+const OptionalSecretSchema = z.preprocess(
+  (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+  z.string().min(1).optional(),
+);
+
+const BooleanEnvSchema = z
+  .enum(['true', 'false', '1', '0'])
+  .transform((value) => value === 'true' || value === '1');
 
 const ConfigSchema = z.object({
+  appEnv: z.enum(['development', 'test', 'production']).default('development'),
+
   /**
    * 管理 API 的 Bearer Token。**必填，无默认值。**
    *
@@ -99,7 +111,28 @@ const ConfigSchema = z.object({
     .transform((v) => v === 'true' || v === '1'),
 
   /** 对外基础 URL，用于在界面上拼接可分享的订阅链接。 */
-  publicBaseUrl: z.string().default('http://127.0.0.1:8787'),
+  publicBaseUrl: z.string().url().default('http://127.0.0.1:8787'),
+
+  /** Google OIDC Web Client. Authentication is enabled only when all three values exist. */
+  googleClientId: OptionalSecretSchema,
+  googleClientSecret: OptionalSecretSchema,
+  sessionSecret: z.preprocess(
+    (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+    z.string().min(MIN_SESSION_SECRET_LENGTH, `SESSION_SECRET 至少需要 ${MIN_SESSION_SECRET_LENGTH} 个字符`).optional(),
+  ),
+  /**
+   * 访问白名单。**空数组 = 谁都不放行**（两处消费点都是 `includes()`，天然 fail closed），
+   * 所以不配置 Google OIDC 的部署可以留空、走 ADMIN_TOKEN。
+   * 一旦配了 OIDC 就必须同时给出白名单 —— 否则会变成「登录流程走得通、但所有人都被拒」
+   * 这种只在真去登录时才暴露的静默失败。由下面的 superRefine 在启动时拦住。
+   */
+  googleAllowedEmails: z
+    .string()
+    .default('')
+    .transform((value) => [...new Set(value.split(',').map((email) => email.trim().toLowerCase()).filter(Boolean))]),
+  sessionCookieSecure: BooleanEnvSchema.default('false'),
+  /** Keep ADMIN_TOKEN Bearer only for local testing. Production must disable it. */
+  allowDevLogin: BooleanEnvSchema.default('true'),
 
   dbPath: z.string().default('./data/subagg.db'),
 
@@ -117,12 +150,12 @@ const ConfigSchema = z.object({
   nodePingIntervalHours: z.coerce.number().int().min(1).max(168).default(12),
 
   /**
-   * IX 中转状态同步间隔（小时）。**0 表示禁用自动同步。**
+   * IX 中转状态同步间隔（分钟）。**0 表示禁用自动同步。**
    *
    * 这只影响"什么时候去中转平台对齐状态"，不影响订阅下发 ——
    * 渲染只读本地映射，平台挂了订阅照常出。
    */
-  ixSyncIntervalHours: z.coerce.number().int().min(0).max(168).default(6),
+  ixSyncIntervalMinutes: z.coerce.number().int().min(0).max(1440).default(5),
   /** 调中转平台 API 的单请求超时。它是外部服务，不能让它拖住调度器。 */
   ixTimeoutMs: z.coerce.number().int().min(1000).max(120000).default(15000),
   /**
@@ -142,6 +175,79 @@ const ConfigSchema = z.object({
   accessLogRetentionDays: z.coerce.number().int().refine((v) => v === 0 || v >= 30, 'ACCESS_LOG_RETENTION_DAYS 必须为 0 或至少 30').default(90),
 
   logLevel: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+}).superRefine((config, ctx) => {
+  const googleParts = [config.googleClientId, config.googleClientSecret, config.sessionSecret];
+  const googlePartCount = googleParts.filter(Boolean).length;
+  if (googlePartCount !== 0 && googlePartCount !== googleParts.length) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['googleClientId'],
+      message: 'GOOGLE_CLIENT_ID、GOOGLE_CLIENT_SECRET、SESSION_SECRET 必须同时配置',
+    });
+  }
+
+  if (googlePartCount === googleParts.length && config.googleAllowedEmails.length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['googleAllowedEmails'],
+      message: '配置了 Google OIDC 就必须配置 GOOGLE_ALLOWED_EMAILS，否则所有账号都会被拒绝',
+    });
+  }
+
+  let publicUrl: URL | undefined;
+  try {
+    publicUrl = new URL(config.publicBaseUrl);
+  } catch {
+    // z.string().url() reports the actionable validation error.
+  }
+
+  if (publicUrl && (publicUrl.username || publicUrl.password || publicUrl.search || publicUrl.hash || publicUrl.pathname !== '/')) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['publicBaseUrl'],
+      message: 'PUBLIC_BASE_URL 必须是无账号、路径、查询参数和片段的站点根地址',
+    });
+  }
+
+  if (config.appEnv === 'production') {
+    if (googlePartCount !== googleParts.length) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['googleClientId'],
+        message: '生产环境必须配置 Google OIDC 与 SESSION_SECRET',
+      });
+    }
+    if (publicUrl?.protocol !== 'https:') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['publicBaseUrl'],
+        message: '生产环境 PUBLIC_BASE_URL 必须使用 HTTPS',
+      });
+    }
+    if (!config.sessionCookieSecure) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['sessionCookieSecure'],
+        message: '生产环境 SESSION_COOKIE_SECURE 必须为 true',
+      });
+    }
+    if (config.allowDevLogin) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['allowDevLogin'],
+        message: '生产环境 ALLOW_DEV_LOGIN 必须为 false',
+      });
+    }
+    // 单用户自托管：生产环境恰好一个 owner。多人协作需要的是 RBAC，不是把白名单拉长
+    // —— 见 SECURITY.md「已知的能力边界」。这里只约束"几个"，不约束"是谁"。
+    if (config.googleAllowedEmails.length !== 1) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['googleAllowedEmails'],
+        message: 'owner_only 生产环境必须且只能配置一个 GOOGLE_ALLOWED_EMAILS',
+      });
+    }
+  }
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
@@ -156,13 +262,26 @@ export type Config = z.infer<typeof ConfigSchema>;
  * 由 `src/index.ts` 在启动时调用一次。失败即退出，不进入服务循环。
  */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+  const appEnv = env['APP_ENV'] ?? 'development';
+  const publicBaseUrl = env['PUBLIC_BASE_URL'] ?? env['WEB_APP_URL'];
+  if (env['PUBLIC_BASE_URL'] && env['WEB_APP_URL'] && env['PUBLIC_BASE_URL'] !== env['WEB_APP_URL']) {
+    throw new Error('配置校验失败：PUBLIC_BASE_URL 与 WEB_APP_URL 必须完全一致');
+  }
+
   const parsed = ConfigSchema.safeParse({
+    appEnv,
     adminToken: env['ADMIN_TOKEN'],
     ipHashSalt: env['IP_HASH_SALT'],
     host: env['HOST'],
     port: env['PORT'],
     trustProxy: env['TRUST_PROXY'],
-    publicBaseUrl: env['PUBLIC_BASE_URL'],
+    publicBaseUrl,
+    googleClientId: env['GOOGLE_CLIENT_ID'],
+    googleClientSecret: env['GOOGLE_CLIENT_SECRET'],
+    sessionSecret: env['SESSION_SECRET'],
+    googleAllowedEmails: env['GOOGLE_ALLOWED_EMAILS'],
+    sessionCookieSecure: env['SESSION_COOKIE_SECURE'] ?? (appEnv === 'production' ? 'true' : 'false'),
+    allowDevLogin: env['ALLOW_DEV_LOGIN'] ?? (appEnv === 'production' ? 'false' : 'true'),
     dbPath: env['DB_PATH'],
     fetchTimeoutMs: env['FETCH_TIMEOUT_MS'],
     fetchMaxBytes: env['FETCH_MAX_BYTES'],
@@ -170,7 +289,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     fetchUserAgent: env['FETCH_USER_AGENT'],
     schedulerIntervalMin: env['SCHEDULER_INTERVAL_MIN'],
     nodePingIntervalHours: env['NODE_PING_INTERVAL_HOURS'],
-    ixSyncIntervalHours: env['IX_SYNC_INTERVAL_HOURS'],
+    ixSyncIntervalMinutes: env['IX_SYNC_INTERVAL_MINUTES'],
     ixTimeoutMs: env['IX_TIMEOUT_MS'],
     ixOrphanThreshold: env['IX_ORPHAN_THRESHOLD'],
     subRateLimit: env['SUB_RATE_LIMIT'],
@@ -200,4 +319,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 export function loadConfigWithDotenv(envFile = '.env'): Config {
   loadDotenv(envFile);
   return loadConfig();
+}
+
+export function googleAuthEnabled(config: Config): boolean {
+  return Boolean(config.googleClientId && config.googleClientSecret && config.sessionSecret);
 }

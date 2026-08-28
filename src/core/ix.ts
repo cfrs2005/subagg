@@ -1,7 +1,7 @@
 /**
  * IX 中转改写：把节点的拨号地址换成中转入口，协议参数一律不动。
  *
- * ## 这一趟 pass 存在的理由
+ * ## 这组纯函数存在的理由
  *
  * L4 端口转发不解 TLS、不改流量。所以「客户端往哪拨号」和「跟谁握手、装成谁」
  * 是两件事 —— 而统一模型里这两件事有 **4 处**是靠"缺省回落到 `server`"隐式绑在
@@ -11,26 +11,14 @@
  * **改 `server` 就是在偷偷改这 4 个值。**所以改写地址时必须把原 server 显式写进
  * 这几个位置 —— 这不是新增语义，而是把改写前已经生效的隐式默认值固化下来。
  *
- * ## 管线位置：applyFilter → applyIx → expandChain → emit
- *
- * - 必须在 `applyFilter` **之后**：`dedupeKey(node,'server-port')` 返回
- *   `${server}:${port}`。若改写发生在去重前，所有节点都指向同一个入口域名，
- *   `dedupe: 'server-port'` 会把它们折叠成一个 —— 用户勾选的节点凭空消失，
- *   而且没有任何报错。同理 `field:'server'` 的筛选与 `{server}` 重命名占位符
- *   都应该看到原始值：用户的规则是针对原节点写的。
- * - 必须在 `expandChain` **之前**：映射按原指纹匹配，此时派生节点还没生成，
- *   命中率 100%；派生节点会自然继承已改写的入口，语义正确。
- *
- * 与 chain.ts 同层、同构、同返回形状：派生只在渲染期发生、**绝不进数据库**，
- * 并且**保留原指纹**。指纹是全系统主键（nodes 表 PK、`FilterRule.pick`、
- * ping 历史、chain 的 `viaFingerprint`、三个 `/api/nodes/:fingerprint/*` 路由），
- * 落库前或改写时重算 server/port 会让用户的勾选、ping 历史、映射关系一起炸。
+ * `applyIx()` 保留为底层地址重建原语；`buildIxRelayNode()` 在此基础上赋予
+ * `IX_` 名称、provider 来源与稳定派生指纹。生产渲染不再临时跑 IX pass：
+ * `NodeCatalog` 先投影原节点与 IX 节点，profile 再统一过滤和输出。
  *
  * 本文件属于 core 纯函数层：无 IO，不读环境变量，不看时钟。
  */
 
-import { normalizeHost } from './fingerprint.js';
-import type { ChainSelector, FilterRule } from './filter.js';
+import { deriveIxRelayFingerprint, normalizeHost } from './fingerprint.js';
 import type {
   H2Options,
   HttpOptions,
@@ -192,6 +180,10 @@ export interface IxOutcome {
   skipped: IxSkip[];
 }
 
+export type IxRelayBuildResult =
+  | { ok: true; node: ProxyNode }
+  | { ok: false; reason: IxSkipReason; detail: string };
+
 function emptyStats(): IxStats {
   return {
     rewritten: 0,
@@ -255,7 +247,7 @@ const DETAIL_GRPC_NO_TLS =
 const DETAIL_UDP_DEAD =
   '该协议的本体跑在 UDP 上（hysteria2 / tuic / QUIC 传输），而这个中转端口不转发 UDP ——' +
   '改写后输出的是一个必然连不上的死节点，且症状是"半坏"（TCP 通、UDP 黑洞），最难归因。' +
-  '下一步：在中转平台给该端口开启 UDP 转发后重新同步，或让这类节点保持直连。';
+  '下一步：在中转平台给该端口开启 UDP 转发后重新同步，或明确选择原节点。';
 
 const DETAIL_UDP_UNKNOWN_STRICT =
   '该协议的本体跑在 UDP 上，而这个中转端口**转不转 UDP 未知**（平台未回报），' +
@@ -267,8 +259,8 @@ function detailEntryInvalid(entry: IxEntry): string {
   return (
     `中转入口「${entry.entryHost}:${entry.entryPort}」不是合法地址` +
     '（主机名不能为空，端口须为 1-65535 的整数）。' +
-    '继续改写会产出 port: 0 一类被客户端直接拒绝的配置，因此保持原样。' +
-    '下一步：到「IX 中转」页重新同步该映射，或删掉这条映射让节点回落直连。'
+    '继续改写会产出 port: 0 一类被客户端直接拒绝的配置，因此 IX 节点不可用。' +
+    '下一步：到「IX 中转」页重新同步该映射，或删除 IX 节点并明确使用原节点。'
   );
 }
 
@@ -277,7 +269,7 @@ function detailEntryUnusable(entry: IxEntry): string {
   return (
     `中转入口 ${where} 当前${STATUS_LABEL[entry.status]}，把流量指过去连不上。` +
     '下一步：到中转平台恢复或重建该端口，再跑一次 IX 状态同步；' +
-    '暂时用不了就先让该节点直连。'
+    '暂时用不了就明确选择旁边保留的原节点。'
   );
 }
 
@@ -781,55 +773,69 @@ export function applyIx(
   return { nodes: out, stats, warnings: buildWarnings(stats, tally, opts), skipped };
 }
 
-// ─────────────────────────────────────────────────────────────
-//  规则层面的交互隐患
-// ─────────────────────────────────────────────────────────────
-
 /**
- * 报三处只能在规则层面看出来的隐患。
+ * Build one durable IX relay projection from an origin node and a local mapping entry.
  *
- * 这三条 `applyIx` 看不到（它拿不到 `FilterRule`），`applyFilter` 也管不了
- * （它不知道 ix 开没开），所以单独一个纯函数，由 render 层与 filter/chain
- * 的 warnings 一起汇总。
+ * The address comes from IX, while protocol credentials and handshake fields come from
+ * the origin node. The relay identity is derived from provider + origin fingerprint, so
+ * a platform-wide entry hostname or port change does not invalidate profile picks or
+ * latency history.
  */
-export function ixRuleInteractionWarnings(rule: FilterRule): string[] {
-  if (rule.ix?.enabled !== true) return [];
-  const warnings: string[] = [];
-
-  // 1. rename 在 filter 内、早于 ix，`{server}`/`{port}` 展开的是**原始**地址 ——
-  //    等于把要藏起来的落地域名印在客户端的节点名上。
-  if (rule.rename?.some((r) => /\{server\}|\{port\}/.test(r.replace))) {
-    warnings.push(
-      '重命名模板里的 {server} / {port} 展开的是原始落地地址（重命名早于 IX 改写），' +
-        '相当于把要藏起来的落地域名印在客户端的节点名上；建议改用 {region} / {regionZh} / {index}',
-    );
+export function buildIxRelayNode(
+  origin: ProxyNode,
+  provider: { id: string; name: string },
+  entry: IxEntry,
+): IxRelayBuildResult {
+  const outcome = applyIx(
+    [origin],
+    new Map([[origin.fingerprint, entry]]),
+    {
+      tag: provider.name,
+      onMissing: 'drop',
+      onUnusable: 'drop',
+      onUnsafe: 'drop',
+    },
+  );
+  const rewritten = outcome.nodes[0];
+  if (!rewritten || outcome.stats.rewritten !== 1 || !rewritten.ix) {
+    const skipped = outcome.skipped[0];
+    return {
+      ok: false,
+      reason: skipped?.reason ?? 'entry-unusable',
+      detail: skipped?.detail ?? 'IX 入口当前不可用。',
+    };
   }
 
-  if (rule.chain?.enabled !== true) return warnings;
+  const identity = {
+    fingerprint: deriveIxRelayFingerprint(provider.id, origin.fingerprint),
+    name: `IX_${origin.name}`,
+    meta: {
+      ...origin.meta,
+      sourceId: `ix:${provider.id}`,
+      sourceName: `IX · ${provider.name}`,
+      tags: [...new Set([...origin.meta.tags, 'ix-relay'])],
+    },
+    ix: {
+      ...rewritten.ix,
+      providerId: provider.id,
+      originFingerprint: origin.fingerprint,
+    },
+  };
 
-  // 2. ix 必须早于 expandChain（派生节点的指纹由 deriveChainFingerprint 算出、
-  //    不在映射表里，chain 之后再改写永远匹配不上，且原指纹已丢失）。
-  //    这个交互**不能靠调顺序解决**，只能上报。
-  if (usesServerField(rule.chain.entry) || usesServerField(rule.chain.landing)) {
-    warnings.push(
-      '链式选择器用 field:"server" 匹配，而 IX 改写必须早于链式展开，' +
-        '这些条件看到的是中转入口地址而不是原落地地址；建议改用 pick / region / name',
-    );
+  switch (rewritten.type) {
+    case 'vmess':
+      return { ok: true, node: { ...rewritten, ...identity } };
+    case 'vless':
+      return { ok: true, node: { ...rewritten, ...identity } };
+    case 'trojan':
+      return { ok: true, node: { ...rewritten, ...identity } };
+    case 'ss':
+      return { ok: true, node: { ...rewritten, ...identity } };
+    case 'ssr':
+      return { ok: true, node: { ...rewritten, ...identity } };
+    case 'hysteria2':
+      return { ok: true, node: { ...rewritten, ...identity } };
+    case 'tuic':
+      return { ok: true, node: { ...rewritten, ...identity } };
   }
-
-  // 3. 一个 ProxyNode 只有一个 server，"一份走中转、一份走直连"在当前模型里不可表达。
-  if (rule.chain.keepLandingDirect === true) {
-    warnings.push(
-      'keepLandingDirect 与 IX 中转同时开启时，保留下来的"直连"副本与链式副本来自同一个' +
-        '已改写的节点对象，两份都走中转 —— 当前模型无法表达"同一节点直连版 + 中转版并存"；' +
-        '想同时要两份请建两个 profile（一个开 IX、一个关）',
-    );
-  }
-
-  return warnings;
-}
-
-function usesServerField(selector: ChainSelector): boolean {
-  const exprs = [...(selector.include ?? []), ...(selector.exclude ?? [])];
-  return exprs.some((expr) => expr.field === 'server');
 }

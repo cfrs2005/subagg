@@ -202,7 +202,7 @@ CREATE TABLE ix_providers (
   -- "v1:<base64url>" 形态），**不是明文**。列名带 _enc 后缀就是为了让
   -- 任何人扫一眼 schema 就知道不能拿去直接用。
   -- 密钥从 ADMIN_TOKEN 派生 —— 轮换 ADMIN_TOKEN 后这些密文解不开，
-  -- 届时应把 provider 标成"需重新录入凭据"并回落直连，不是让服务崩。
+  -- 届时应把 provider 标成"需重新录入凭据"并让 IX 节点不可用，不是让服务崩。
   api_key_enc     TEXT,
   username        TEXT,
   password_enc    TEXT,
@@ -212,7 +212,7 @@ CREATE TABLE ix_providers (
   -- 建端口时默认落在哪条线路上。NULL = 用平台返回的第一条。
   default_line_id INTEGER,
   enable_udp      INTEGER NOT NULL DEFAULT 1,
-  -- 全局总闸。关掉后所有 profile 一起回落直连，用于故障时一键止血。
+  -- Provider 总闸。关掉后关联 IX 派生节点不可用。
   enabled         INTEGER NOT NULL DEFAULT 1,
   last_probe_at   INTEGER,
   last_error      TEXT,
@@ -290,6 +290,62 @@ CREATE INDEX idx_ix_map_fingerprint ON ix_port_mappings(fingerprint);
 -- TCP 通、UDP 黑洞的死节点（最难归因的那种半坏）。
 -- 保持 NULL 则 core 的 udpPolicy 会走"改写 + 留警告"，如实说"我还不知道"。
 ALTER TABLE ix_port_mappings ADD COLUMN entry_udp INTEGER;
+`,
+  },
+  {
+    version: 6,
+    name: 'ix_remote_port_refs',
+    sql: `
+-- 删除派生 IX 节点前必须确认同一远端端口没有其他本地引用。
+CREATE INDEX idx_ix_map_remote_port
+  ON ix_port_mappings(provider_id, remote_port_id);
+`,
+  },
+  {
+    version: 7,
+    name: 'google_oidc_sessions',
+    sql: `
+-- Google proves identity only. The application owns accounts, sessions, revocation, and CSRF.
+CREATE TABLE google_accounts (
+  id             TEXT PRIMARY KEY,
+  google_sub     TEXT NOT NULL UNIQUE,
+  email          TEXT NOT NULL,
+  email_verified INTEGER NOT NULL CHECK (email_verified IN (0, 1)),
+  display_name   TEXT NOT NULL,
+  avatar_url     TEXT,
+  created_at     INTEGER NOT NULL,
+  last_login_at  INTEGER NOT NULL
+);
+
+CREATE INDEX idx_google_accounts_email ON google_accounts(email);
+
+-- The browser holds high-entropy values; the database stores server-keyed HMAC values only.
+CREATE TABLE web_sessions (
+  id           TEXT PRIMARY KEY,
+  account_id   TEXT NOT NULL REFERENCES google_accounts(id) ON DELETE CASCADE,
+  token_hash   TEXT NOT NULL UNIQUE,
+  csrf_hash    TEXT NOT NULL,
+  expires_at   INTEGER NOT NULL,
+  created_at   INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL,
+  revoked_at   INTEGER
+);
+
+CREATE INDEX idx_web_sessions_account ON web_sessions(account_id);
+CREATE INDEX idx_web_sessions_expiry ON web_sessions(expires_at);
+
+-- OAuth attempts are single-use. State is hashed and the short-lived PKCE verifier is encrypted.
+CREATE TABLE oauth_login_attempts (
+  token_hash        TEXT PRIMARY KEY,
+  state_hash        TEXT NOT NULL UNIQUE,
+  nonce             TEXT NOT NULL,
+  code_verifier_enc TEXT NOT NULL,
+  expires_at        INTEGER NOT NULL,
+  created_at        INTEGER NOT NULL,
+  used_at           INTEGER
+);
+
+CREATE INDEX idx_oauth_attempt_expiry ON oauth_login_attempts(expires_at);
 `,
   },
 ];

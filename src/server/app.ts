@@ -14,12 +14,14 @@
 
 import rateLimit from '@fastify/rate-limit';
 import fastifyStatic from '@fastify/static';
+import fastifyCookie from '@fastify/cookie';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { fileURLToPath } from 'node:url';
 import type { AppContext } from '../context.js';
 import { sniffClient } from '../core/emit/index.js';
 import { hashIp } from '../db/repo/sharing.js';
 import { createAdminRoutes } from './routes/admin.js';
+import { createAuthRoutes } from './routes/auth.js';
 import { createIxRoutes } from './routes/ix.js';
 import { createSubRoutes } from './routes/sub.js';
 
@@ -63,6 +65,8 @@ export async function buildApp(ctx: AppContext): Promise<FastifyInstance> {
     // 订阅体可能不小（几百个节点的 Clash YAML 能到几百 KB），
     // 但请求体没有大到需要放宽的场景，保持默认的 1 MiB 上限
   });
+
+  await app.register(fastifyCookie);
 
   // ── 限流 ──────────────────────────────────────────────
   // global: false —— 只在显式声明了 config.rateLimit 的路由上生效。
@@ -154,9 +158,12 @@ export async function buildApp(ctx: AppContext): Promise<FastifyInstance> {
   // ── 健康检查 ──────────────────────────────────────────
   // 无需鉴权：它不泄漏任何信息，而 Docker HEALTHCHECK 与外部监控都需要它。
   app.get('/healthz', async () => ({ ok: true }));
+  app.get('/privacy', async (_req, reply) => reply.redirect('/privacy.html'));
+  app.get('/terms', async (_req, reply) => reply.redirect('/terms.html'));
 
   // ── 路由 ──────────────────────────────────────────────
   await app.register(createSubRoutes(ctx), { prefix: '/sub' });
+  await app.register(createAuthRoutes(ctx), { prefix: '/auth' });
   await app.register(createAdminRoutes(ctx), { prefix: '/api' });
   // IX 中转是 `/api` 下的一组，但**是独立插件**：Fastify 的 hook 按封装上下文
   // 继承，admin 插件里那句 `addHook('preHandler', requireAdmin(ctx))` 覆盖不到它。

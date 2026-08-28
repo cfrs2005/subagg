@@ -164,6 +164,10 @@ export interface IxLink {
   originServer: string;
   /** 改写前的 port。 */
   originPort: number;
+  /** 派生节点所属的 IX provider。底层临时改写原语可以省略该字段。 */
+  providerId?: string;
+  /** 派生节点对应的原节点指纹。底层临时改写原语可以省略该字段。 */
+  originFingerprint?: string;
 }
 
 interface BaseNode {

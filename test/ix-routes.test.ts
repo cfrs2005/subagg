@@ -25,7 +25,7 @@ import { createContext, type AppContext } from '../src/context.js';
 import { deriveKey, encryptSecret } from '../src/core/secret.js';
 import type { Logger } from '../src/logger.js';
 import { buildApp } from '../src/server/app.js';
-import type { IxEnsureResult, IxProbeResult, IxRemoveResult } from '../src/services/ix.js';
+import type { IxEnsureResult, IxProbeResult, IxRefreshResult, IxRemoveResult } from '../src/services/ix.js';
 import { makeNode } from './helpers.js';
 
 // ─────────────────────────────────────────────────────────────
@@ -65,6 +65,8 @@ const logger: Logger = {
 
 function makeConfig(over: Partial<Config> = {}): Config {
   return {
+    appEnv: 'test',
+    allowDevLogin: true,
     adminToken: ADMIN_TOKEN,
     ipHashSalt: 'test-salt',
     host: '127.0.0.1',
@@ -78,7 +80,7 @@ function makeConfig(over: Partial<Config> = {}): Config {
     fetchUserAgent: 'test',
     schedulerIntervalMin: 0,
     nodePingIntervalHours: 12,
-    ixSyncIntervalHours: 6,
+    ixSyncIntervalMinutes: 5,
     ixTimeoutMs: 15_000,
     ixOrphanThreshold: 5,
     subRateLimit: 1000,
@@ -228,11 +230,13 @@ const ROUTES: ReadonlyArray<{ method: 'GET' | 'POST' | 'PATCH' | 'DELETE'; url: 
   { method: 'GET', url: '/api/ix/mappings' },
   { method: 'POST', url: '/api/ix/mappings' },
   { method: 'DELETE', url: '/api/ix/mappings/abc123' },
+  { method: 'POST', url: '/api/ix/relays' },
+  { method: 'DELETE', url: '/api/ix/relays/abc123' },
   { method: 'POST', url: '/api/ix/refresh' },
 ];
 
 describe('/api/ix 鉴权', () => {
-  it('九个路由无 Bearer 一律 401，且不泄漏任何细节', async () => {
+  it('十一个路由无 Bearer 一律 401，且不泄漏任何细节', async () => {
     const { app } = await setup();
     for (const route of ROUTES) {
       const res = await app.inject({ method: route.method, url: route.url, payload: {} });
@@ -446,7 +450,7 @@ describe('/api/ix/providers CRUD', () => {
     }
   });
 
-  it('删掉 provider 时如实告知：远端端口不会被自动删，仍占配额', async () => {
+  it('provider 仍有 IX 节点时拒绝删除，避免远端端口失去追踪', async () => {
     const { app, ctx } = await setup();
     const created = await createProvider(app);
     ctx.ixMappings.upsert({
@@ -462,11 +466,11 @@ describe('/api/ix/providers CRUD', () => {
       url: `/api/ix/providers/${created.id}`,
       headers: AUTH,
     });
-    const payload = body<{ deleted: boolean; warning?: string }>(res);
-    expect(payload.deleted).toBe(true);
-    expect(payload.warning).toContain('配额');
-    // 本地映射被 ON DELETE CASCADE 带走
-    expect(ctx.ixMappings.list()).toEqual([]);
+    expect(res.statusCode).toBe(409);
+    const payload = body<{ deleted: boolean; error: string }>(res);
+    expect(payload.deleted).toBe(false);
+    expect(payload.error).toContain('先在节点列表删除');
+    expect(ctx.ixMappings.list()).toHaveLength(1);
   });
 });
 
@@ -558,59 +562,63 @@ describe('/api/ix 参数校验', () => {
   });
 });
 
-// ─────────────────────────────────────────────────────────────
-//  profile 规则里的 ix 字段
-// ─────────────────────────────────────────────────────────────
-
-describe('profile 规则里的 ix', () => {
-  it('POST 一个带 ix 的 profile，GET 回来三个字段原样保留', async () => {
-    // 这是最容易漏的一处：zod schema 不认识的键会被**静默丢掉**，
-    // 表现是界面上配好的 IX 开关消失、订阅还是直连，而日志里什么都没有。
-    const { app } = await setup();
-    const ix = { enabled: true, providerId: 'provider-uuid-1', fillOriginHost: false };
-
-    const created = await app.inject({
-      method: 'POST',
-      url: '/api/profiles',
-      headers: AUTH,
-      payload: { name: '走中转', rule: { ix, regions: ['HK'] } },
-    });
-    expect(created.statusCode).toBe(201);
-    expect(body<{ rule: { ix: unknown } }>(created).rule.ix).toEqual(ix);
-
-    const listed = body<Array<{ rule: { ix: unknown } }>>(
-      await app.inject({ method: 'GET', url: '/api/profiles', headers: AUTH }),
-    );
-    expect(listed[0]!.rule.ix).toEqual(ix);
-  });
-
-  it('字段名是 fillOriginHost 而不是 fillSni —— 写错名字必须被丢掉而非静默生效', async () => {
-    const { app } = await setup();
-    const created = await app.inject({
-      method: 'POST',
-      url: '/api/profiles',
-      headers: AUTH,
-      payload: { name: '拼错了', rule: { ix: { enabled: true, fillSni: false } } },
-    });
-    expect(created.statusCode).toBe(201);
-    // zod 剥掉未知键：存下来的只有 enabled。断言它是为了钉住"名字就是
-    // fillOriginHost"，将来谁把 core 的字段改名，这条会红。
-    expect(body<{ rule: { ix: Record<string, unknown> } }>(created).rule.ix).toEqual({ enabled: true });
-  });
-
-  it('/api/preview 也接受带 ix 的规则', async () => {
+describe('/api/ix/relays', () => {
+  it('POST 接收 providerId + sourceFingerprints 并返回派生节点身份', async () => {
     const { app, ctx } = await setup();
-    ctx.nodes.replaceForSubscription('s1', [ssNode('香港 01', 'hk.example.com', 8443)]);
+    const provider = await createProvider(app);
+    let seen: readonly string[] = [];
+    ctx.ix.ensureMappings = async (providerId, fingerprints): Promise<IxEnsureResult> => {
+      expect(providerId).toBe(provider.id);
+      seen = fingerprints;
+      return {
+        ok: true,
+        providerId,
+        items: [{
+          fingerprint: 'source-fp',
+          name: 'bwg-ssr',
+          outcome: 'created',
+          detail: '已创建',
+          relayFingerprint: 'relay-fp',
+          relayName: 'IX_bwg-ssr',
+          entryHost: 'entry.example',
+          entryPort: 52_001,
+        }],
+        warnings: [],
+      };
+    };
     const res = await app.inject({
       method: 'POST',
-      url: '/api/preview',
+      url: '/api/ix/relays',
       headers: AUTH,
-      payload: { rule: { ix: { enabled: true, fillOriginHost: true } }, target: 'clash.meta' },
+      payload: { providerId: provider.id, sourceFingerprints: ['source-fp'] },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(seen).toEqual(['source-fp']);
+    expect(body<{ relays: unknown[] }>(res).relays[0]).toMatchObject({
+      sourceFingerprint: 'source-fp',
+      relayFingerprint: 'relay-fp',
+      relayName: 'IX_bwg-ssr',
+    });
+  });
+
+  it('DELETE 使用派生指纹并默认删除远端端口', async () => {
+    const { app, ctx } = await setup();
+    let seen = '';
+    ctx.ix.removeRelay = async (fingerprint): Promise<IxRemoveResult> => {
+      seen = fingerprint;
+      return { ok: true, removedLocal: true, remoteDeleted: true, warnings: [] };
+    };
+    const res = await app.inject({
+      method: 'DELETE',
+      url: '/api/ix/relays/relay-fp',
+      headers: AUTH,
     });
     expect(res.statusCode).toBe(200);
-    // 没有 provider 时 IX 那趟必须给出可读原因，而不是悄悄不干活
-    const parsed = body<{ warnings: string[]; ix: unknown }>(res);
-    expect(parsed.warnings.join()).toContain('中转商');
+    expect(seen).toBe('relay-fp');
+    expect(body<{ removed: boolean; remoteDeleted: boolean }>(res)).toMatchObject({
+      removed: true,
+      remoteDeleted: true,
+    });
   });
 });
 
@@ -930,7 +938,17 @@ describe('/api/ix probe 与 refresh', () => {
     const { app, ctx } = await setup();
     const created = await createProvider(app);
 
-    // 一条映射都没有时，真实 refresh 提前返回，不构造客户端、不出站
+    ctx.ix.refresh = async (providerId): Promise<IxRefreshResult> => ({
+      ok: true,
+      providerId,
+      checked: 0,
+      updated: 0,
+      discovered: 0,
+      missingRemote: 0,
+      orphaned: 0,
+      recovered: 0,
+      warnings: [],
+    });
     const res = await app.inject({
       method: 'POST',
       url: '/api/ix/refresh',
@@ -973,11 +991,11 @@ describe('/api/ix probe 与 refresh', () => {
 
 describe('/api/meta 的 IX 常量', () => {
   it('暴露 ixAuthModes / ixStates / 三个数字', async () => {
-    const { app } = await setup({ ixSyncIntervalHours: 8, ixOrphanThreshold: 3 });
+    const { app } = await setup({ ixSyncIntervalMinutes: 8, ixOrphanThreshold: 3 });
     const meta = body<{
       ixAuthModes: Array<{ value: string; label: string }>;
       ixStates: Array<{ value: string; label: string }>;
-      ixSyncIntervalHours: number;
+      ixSyncIntervalMinutes: number;
       ixOrphanThreshold: number;
       ixMaxFingerprints: number;
     }>(await app.inject({ method: 'GET', url: '/api/meta', headers: AUTH }));
@@ -985,7 +1003,7 @@ describe('/api/meta 的 IX 常量', () => {
     expect(meta.ixAuthModes.map((m) => m.value)).toEqual(['api-key', 'login']);
     expect(meta.ixAuthModes.every((m) => m.label.length > 0)).toBe(true);
     expect(meta.ixStates.map((s) => s.value)).toEqual(['pending', 'active', 'error', 'orphan']);
-    expect(meta.ixSyncIntervalHours).toBe(8);
+    expect(meta.ixSyncIntervalMinutes).toBe(8);
     expect(meta.ixOrphanThreshold).toBe(3);
     // 前端拿它做同一份预检，别再硬编码一份
     expect(meta.ixMaxFingerprints).toBe(50);

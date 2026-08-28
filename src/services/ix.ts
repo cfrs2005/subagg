@@ -7,8 +7,8 @@
  *
  * ## 两条不可动摇的分工
  *
- * 1. **渲染热路径绝不出站。** `entriesFor()` 是纯本地 SQLite 同步读 ——
- *    平台挂了、限流了、JWT 过期了，订阅照常出（映射不可用则回落直连）。
+ * 1. **节点目录与渲染热路径绝不出站。** `relayViews()` 只读本地 SQLite ——
+ *    平台挂了、限流了、JWT 过期了，订阅仍可使用最后一次入口。
  *    所有 `async` 方法都只从管理路由或调度器进入，永不出现在 `/sub/:token` 上。
  * 2. **`state` 与 `IxPortStatus` 不是同一个枚举。** DB 里 `state` 和
  *    `suspended` 是两列，core 的 `IxPortStatus` 是一个五态枚举。
@@ -24,7 +24,15 @@
  * 孤儿只标记、**绝不自动删远端端口**（用户已明确决策）。
  */
 
-import type { IxEntry, IxEntryMap, IxPortStatus } from '../core/ix.js';
+import {
+  buildIxRelayNode,
+  checkIxSafety,
+  type IxEntry,
+  type IxEntryMap,
+  type IxPortStatus,
+} from '../core/ix.js';
+import { deriveIxRelayFingerprint } from '../core/fingerprint.js';
+import type { ProxyNode, ProxyType } from '../core/types.js';
 import { decryptSecret, encryptSecret, isSecretDecryptError } from '../core/secret.js';
 import type { Config } from '../config.js';
 import type { Logger } from '../logger.js';
@@ -106,6 +114,8 @@ export interface IxRefreshResult {
   checked: number;
   /** 从远端刷到新状态的映射数。 */
   updated: number;
+  /** 本轮从平台已有端口中自动发现并认领的本地映射数。 */
+  discovered: number;
   /** 远端端口已消失的映射数。 */
   missingRemote: number;
   /** 本轮新标成孤儿的映射数。 */
@@ -124,6 +134,27 @@ export interface IxRemoveResult {
   remotePortId?: number;
   warnings: string[];
   error?: string;
+}
+
+export type IxRelayState = 'active' | 'stale' | 'pending' | 'unavailable';
+
+export interface IxRelayView {
+  fingerprint: string;
+  name: string;
+  type: ProxyType;
+  server: string;
+  port: number;
+  region: string | null;
+  sourceId: string;
+  sourceName: string;
+  tags: string[];
+  firstSeen: number;
+  lastSeen: number;
+  originFingerprint: string;
+  providerId: string;
+  relayState: IxRelayState;
+  relayError: string | null;
+  node?: ProxyNode;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -160,7 +191,7 @@ function isDecryptFailureNote(note: string): boolean {
  * 而那批节点会全部连不上、且用户从界面上看不出任何异常。
  *
  * `error`/`orphan` 刻意不映射成 `active` 之外的新语义：
- * - `error` → `'unknown'`：我们不知道它还能不能用，core 会保守地回落直连。
+ * - `error` → `'unknown'`：我们不知道它还能不能用，派生目录会标记为不可用。
  * - `orphan` → `'expired'`：节点已从上游消失，这条入口是过期的历史遗留。
  */
 function statusFor(mapping: IxMapping): IxPortStatus {
@@ -180,7 +211,7 @@ function statusFor(mapping: IxMapping): IxPortStatus {
 
 const DETAIL_REMOTE_GONE =
   '远端已经没有这条映射对应的转发端口了（可能在平台上被删除或过期）。' +
-  '下一步：在「IX 中转」页重新为该节点建端口，或删掉这条映射让节点回落直连。';
+  '下一步：在「IX 中转」页重新为该节点建端口，或删除 IX 节点并明确使用原节点。';
 
 function detailOrphan(missing: number): string {
   return (
@@ -201,13 +232,96 @@ export class IxService {
     return this.deps.now ? this.deps.now() : Date.now();
   }
 
+  /**
+   * Project durable IX mappings into user-visible relay nodes.
+   *
+   * Active and stale relays include a complete ProxyNode. Pending/unavailable relays
+   * remain visible as metadata but cannot be emitted, copied or pinged. This prevents
+   * an `IX_` name from silently falling back to the origin address.
+   */
+  relayViews(): IxRelayView[] {
+    const origins = new Map(this.deps.nodes.listAll().map((node) => [node.fingerprint, node]));
+    const providers = new Map(this.deps.providers.list().map((provider) => [provider.id, provider]));
+    const views: IxRelayView[] = [];
+
+    for (const mapping of this.deps.mappings.list()) {
+      const origin = origins.get(mapping.fingerprint);
+      const provider = providers.get(mapping.providerId);
+      if (!origin || !provider) continue;
+
+      const fingerprint = deriveIxRelayFingerprint(provider.id, origin.fingerprint);
+      const sourceId = `ix:${provider.id}`;
+      const sourceName = `IX · ${provider.name}`;
+      const base: IxRelayView = {
+        fingerprint,
+        name: `IX_${origin.name}`,
+        type: origin.type,
+        server: mapping.entryHost ?? mapping.targetHost,
+        port: mapping.entryPort ?? mapping.targetPort,
+        region: origin.meta.region ?? null,
+        sourceId,
+        sourceName,
+        tags: [...new Set([...origin.meta.tags, 'ix-relay'])],
+        firstSeen: mapping.createdAt,
+        lastSeen: mapping.updatedAt,
+        originFingerprint: origin.fingerprint,
+        providerId: provider.id,
+        relayState: 'unavailable',
+        relayError: mapping.lastError ?? mapping.syncError,
+      };
+
+      if (mapping.state === 'pending' || mapping.entryHost === null || mapping.entryPort === null) {
+        views.push({ ...base, relayState: 'pending' });
+        continue;
+      }
+      if (!provider.enabled) {
+        views.push({ ...base, relayError: 'IX 提供商已停用。' });
+        continue;
+      }
+      if (mapping.state !== 'active' || mapping.suspended || mapping.syncError !== null) {
+        const reason = mapping.suspended
+          ? 'IX 端口已被平台挂起。'
+          : mapping.syncError ?? mapping.lastError ?? 'IX 端口当前不可用。';
+        views.push({ ...base, relayError: reason });
+        continue;
+      }
+
+      const built = buildIxRelayNode(
+        origin,
+        provider,
+        {
+          entryHost: mapping.entryHost,
+          entryPort: mapping.entryPort,
+          status: 'active',
+          ...(mapping.entryUdp !== null ? { udp: mapping.entryUdp } : {}),
+          ...(mapping.lineName !== null ? { label: mapping.lineName } : {}),
+        },
+      );
+      if (!built.ok) {
+        views.push({ ...base, relayError: built.detail });
+        continue;
+      }
+
+      views.push({
+        ...base,
+        relayState: provider.lastError === null ? 'active' : 'stale',
+        relayError: provider.lastError,
+        node: built.node,
+      });
+    }
+    return views;
+  }
+
+  relayView(relayFingerprint: string): IxRelayView | undefined {
+    return this.relayViews().find((view) => view.fingerprint === relayFingerprint);
+  }
+
   // ── provider 解析 ─────────────────────────────────────
 
   /**
    * 决定用哪个中转商。
    *
-   * 给了 id 就取它（**不管总闸开没开** —— 管理页要能对着一个关掉的 provider
-   * 做体检；总闸由渲染路径自己判，见 `services/render.ts`）。
+   * 给了 id 就取它（**不管总闸开没开** —— 管理页仍要能对关掉的 provider 做体检）。
    *
    * 没给 id 时取 `listEnabled()` 的第一个。这里的 tie-break 是计划里的空白，
    * 补成：**按 `created_at` 取最早建的那个**（`listEnabled()` 已经这么排序，
@@ -222,8 +336,8 @@ export class IxService {
         return {
           warnings: [],
           reason:
-            `规则指定的中转商（${providerRef(providerId)}…）不存在，可能已被删除。` +
-            '下一步：到「IX 中转」页重新选择中转商，或关掉这条 profile 的 IX 开关。',
+            `指定的中转商（${providerRef(providerId)}…）不存在，可能已被删除。` +
+            '下一步：到「IX 中转」页重新选择通道。',
         };
       }
       return { provider, warnings: [] };
@@ -244,8 +358,8 @@ export class IxService {
     return {
       provider: first,
       warnings: [
-        `IX 中转：当前有 ${enabled.length} 个启用中的中转商，而规则没指定用哪个，` +
-          `已按创建时间取最早的「${first.name}」；想用别的请在 profile 的 IX 设置里显式选择`,
+        `IX 中转：当前有 ${enabled.length} 个启用中的中转商，而请求没指定用哪个，` +
+          `已按创建时间取最早的「${first.name}」；生成 IX 节点时应显式选择通道`,
       ],
     };
   }
@@ -467,6 +581,7 @@ export class IxService {
         ok: false,
         checked: 0,
         updated: 0,
+        discovered: 0,
         missingRemote: 0,
         orphaned: 0,
         recovered: 0,
@@ -479,6 +594,7 @@ export class IxService {
       providerId: provider.id,
       checked: 0,
       updated: 0,
+      discovered: 0,
       missingRemote: 0,
       orphaned: 0,
       recovered: 0,
@@ -486,10 +602,12 @@ export class IxService {
     };
 
     const mappings = this.deps.mappings.listByProvider(provider.id);
-    if (mappings.length === 0) return empty;
 
     const client = this.clientFor(provider);
-    if (!client.ok) return { ...empty, ok: false, error: client.reason };
+    if (!client.ok) {
+      this.deps.providers.update(provider.id, { lastError: client.reason }, this.now());
+      return { ...empty, ok: false, error: client.reason };
+    }
 
     let ports: IxPort[];
     try {
@@ -501,49 +619,88 @@ export class IxService {
     }
 
     const { byId, byTarget } = indexPorts(ports);
-    const localFingerprints = new Set(this.deps.nodes.listAll().map((node) => node.fingerprint));
+    const localNodes = this.deps.nodes.listAll();
+    const localFingerprints = new Set(localNodes.map((node) => node.fingerprint));
 
     const result = { ...empty, checked: mappings.length };
     const now = this.now();
     const threshold = this.deps.config.ixOrphanThreshold;
 
-    for (const mapping of mappings) {
-      // id 找不到就按目标地址再找一次：用户可能在平台上手工删了重建，
-      // 那个新端口指向同一个落地，认回来比标 error 有用。
-      const port =
-        (mapping.remotePortId !== null ? byId.get(mapping.remotePortId) : undefined) ??
-        byTarget.get(targetOf(mapping.targetHost, mapping.targetPort).toLowerCase());
-
-      const patch: IxMappingPatch = port
-        ? mappingPatchFromPort(port, now)
-        : { state: 'error', lastError: DETAIL_REMOTE_GONE, remoteSyncedAt: now };
-      if (port) result.updated += 1;
-      else result.missingRemote += 1;
-
-      // 孤儿判定压在最后：它可以覆盖上面算出来的 state。
-      // 注意 bumpMissing() 对不存在的映射也返回 0，与"计数真的是 0"不可区分 ——
-      // 这里遍历的都是刚从库里列出来的映射，行一定存在，所以返回值可信。
-      if (localFingerprints.has(mapping.fingerprint)) {
-        if (mapping.missingCount > 0) {
-          this.deps.mappings.resetMissing(provider.id, mapping.fingerprint, now);
-          result.recovered += 1;
-        }
-      } else {
-        const missing = this.deps.mappings.bumpMissing(provider.id, mapping.fingerprint, now);
-        if (missing >= threshold) {
-          if (mapping.state !== 'orphan') result.orphaned += 1;
-          patch.state = 'orphan';
-          patch.lastError = detailOrphan(missing);
+    this.deps.mappings.transaction(() => {
+      // 首次接入 provider 时，本地映射表通常是空的，但平台上可能已有手工端口。
+      // 把远端 target 与原节点地址做**精确匹配**后自动认领，绝不调用 createPort。
+      const existingFingerprints = new Set(mappings.map((mapping) => mapping.fingerprint));
+      const nodesByTarget = new Map<string, typeof localNodes>();
+      for (const node of localNodes) {
+        if (!checkIxSafety(node).ok) continue;
+        const key = targetOf(node.server, node.port).toLowerCase();
+        const bucket = nodesByTarget.get(key) ?? [];
+        bucket.push(node);
+        nodesByTarget.set(key, bucket);
+      }
+      for (const port of [...ports].sort((left, right) => left.id - right.id)) {
+        for (const target of port.target_address_list ?? []) {
+          for (const node of nodesByTarget.get(target.trim().toLowerCase()) ?? []) {
+            if (existingFingerprints.has(node.fingerprint)) continue;
+            const saved = this.deps.mappings.upsert(
+              {
+                providerId: provider.id,
+                fingerprint: node.fingerprint,
+                targetHost: node.server,
+                targetPort: node.port,
+                ...mappingPatchFromPort(port, now),
+                missingCount: 0,
+              },
+              now,
+            );
+            mappings.push(saved);
+            existingFingerprints.add(node.fingerprint);
+            result.discovered += 1;
+          }
         }
       }
+      result.checked = mappings.length;
 
-      this.deps.mappings.update(provider.id, mapping.fingerprint, patch, now);
-    }
+      for (const mapping of mappings) {
+        // id 找不到就按目标地址再找一次：用户可能在平台上手工删了重建，
+        // 那个新端口指向同一个落地，认回来比标 error 有用。
+        const port =
+          (mapping.remotePortId !== null ? byId.get(mapping.remotePortId) : undefined) ??
+          byTarget.get(targetOf(mapping.targetHost, mapping.targetPort).toLowerCase());
+
+        const patch: IxMappingPatch = port
+          ? mappingPatchFromPort(port, now)
+          : { state: 'error', lastError: DETAIL_REMOTE_GONE, remoteSyncedAt: now };
+        if (port) result.updated += 1;
+        else result.missingRemote += 1;
+
+        // 孤儿判定压在最后：它可以覆盖上面算出来的 state。
+        // 注意 bumpMissing() 对不存在的映射也返回 0，与"计数真的是 0"不可区分 ——
+        // 这里遍历的都是刚从库里列出来的映射，行一定存在，所以返回值可信。
+        if (localFingerprints.has(mapping.fingerprint)) {
+          if (mapping.missingCount > 0) {
+            this.deps.mappings.resetMissing(provider.id, mapping.fingerprint, now);
+            result.recovered += 1;
+          }
+        } else {
+          const missing = this.deps.mappings.bumpMissing(provider.id, mapping.fingerprint, now);
+          if (missing >= threshold) {
+            if (mapping.state !== 'orphan') result.orphaned += 1;
+            patch.state = 'orphan';
+            patch.lastError = detailOrphan(missing);
+          }
+        }
+
+        this.deps.mappings.update(provider.id, mapping.fingerprint, patch, now);
+      }
+    });
+    this.deps.providers.update(provider.id, { lastError: null }, now);
 
     this.deps.logger.info('IX：状态同步完成', {
       providerRef: providerRef(provider.id),
       checked: result.checked,
       updated: result.updated,
+      discovered: result.discovered,
       missingRemote: result.missingRemote,
       orphaned: result.orphaned,
       recovered: result.recovered,
@@ -561,6 +718,20 @@ export class IxService {
   }
 
   // ── 删除映射 ─────────────────────────────────────────
+
+  async removeRelay(relayFingerprint: string): Promise<IxRemoveResult> {
+    const relay = this.relayView(relayFingerprint);
+    if (!relay) {
+      return {
+        ok: false,
+        removedLocal: false,
+        remoteDeleted: false,
+        warnings: [],
+        error: 'IX 派生节点不存在（可能已经被删除）。',
+      };
+    }
+    return this.removeMapping(relay.providerId, relay.originFingerprint, { deleteRemote: true });
+  }
 
   /**
    * 删一条映射，可选连远端端口一起删。
@@ -592,11 +763,29 @@ export class IxService {
           `远端端口 ${mapping.remotePortId} 仍然存在，会继续占用线路配额；` +
             '需要一起删请重新执行并勾选"同时删除远端端口"',
         );
+      } else if (options.deleteRemote) {
+        warnings.push('平台尚未分配远端端口 id，本次只删除本地 IX 节点。');
       }
       const removedLocal = this.deps.mappings.delete(providerId, fingerprint);
       const result: IxRemoveResult = { ok: removedLocal, removedLocal, remoteDeleted: false, warnings };
       if (mapping.remotePortId !== null) result.remotePortId = mapping.remotePortId;
       return result;
+    }
+
+    const shared = this.deps.mappings.listByRemotePort(providerId, mapping.remotePortId);
+    if (shared.length > 1) {
+      const removedLocal = this.deps.mappings.delete(providerId, fingerprint);
+      warnings.push(
+        `远端端口 ${mapping.remotePortId} 仍被另外 ${shared.length - 1} 个 IX 节点使用，` +
+          '本次只删除当前派生节点；最后一个引用删除时才会删除远端端口。',
+      );
+      return {
+        ok: removedLocal,
+        removedLocal,
+        remoteDeleted: false,
+        remotePortId: mapping.remotePortId,
+        warnings,
+      };
     }
 
     const provider = this.deps.providers.get(providerId);
@@ -623,11 +812,42 @@ export class IxService {
     }
 
     const now = this.now();
+    let deleteError: string | undefined;
     try {
       await client.client.deletePort(mapping.remotePortId);
     } catch (err) {
-      const message = describeError(err);
-      // 如实上报，不假装成功；本地映射留着，配额泄漏才看得见
+      deleteError = describeError(err);
+    }
+
+    let stillExists: boolean;
+    try {
+      const ports = await client.client.listAllPorts();
+      stillExists = ports.some((port) => port.id === mapping.remotePortId);
+    } catch (err) {
+      const verifyError = describeError(err);
+      this.deps.mappings.update(
+        providerId,
+        fingerprint,
+        {
+          state: 'error',
+          lastError:
+            `无法确认远端端口 ${mapping.remotePortId} 是否已删除：${verifyError}。` +
+            '本地 IX 节点已保留，避免远端端口继续占配额却失去追踪。',
+        },
+        now,
+      );
+      return {
+        ok: false,
+        removedLocal: false,
+        remoteDeleted: false,
+        remotePortId: mapping.remotePortId,
+        warnings,
+        error: verifyError,
+      };
+    }
+
+    if (stillExists) {
+      const message = deleteError ?? '平台删除接口返回后端口仍然存在';
       this.deps.mappings.update(
         providerId,
         fingerprint,
@@ -635,8 +855,7 @@ export class IxService {
           state: 'error',
           lastError:
             `删除远端端口 ${mapping.remotePortId} 失败：${message}。` +
-            '本地映射已保留（否则这个端口会永远占着配额而界面上看不到）。' +
-            '下一步：稍后重试，或到中转平台手动删除该端口。',
+            '本地映射已保留，IX 节点也继续显示；下一步：稍后重试，或到中转平台手动删除。',
         },
         now,
       );
@@ -649,6 +868,8 @@ export class IxService {
         error: message,
       };
     }
+
+    if (deleteError) warnings.push(`删除接口返回「${deleteError}」，但回读确认远端端口已不存在。`);
 
     const removedLocal = this.deps.mappings.delete(providerId, fingerprint);
     this.deps.logger.info('IX：映射与远端端口已删除', {

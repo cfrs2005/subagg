@@ -92,23 +92,6 @@ const ChainRuleSchema = z.object({
 });
 
 /**
- * IX 中转改写规则。
- *
- * **漏了这一段是最贵的一种漏**：schema 不认识的键会被 zod 静默丢掉，
- * 于是界面上配好的 IX 开关在 `POST /profiles` 时无声消失，
- * 用户看到的是"开关拨了但订阅还是直连"，而日志里什么都没有。
- *
- * 字段名是 `fillOriginHost` 而**不是** `fillSni`：它一次管四处
- * （`tls.sni` + ws / h2 / http 三个 Host），叫 fillSni 会让人以为只补 SNI。
- */
-const IxRuleSchema = z.object({
-  enabled: z.boolean().optional(),
-  /** provider id 是 UUID。core 层只当它是不透明标识，这里只卡长度。 */
-  providerId: z.string().min(1).max(64).optional(),
-  fillOriginHost: z.boolean().optional(),
-});
-
-/**
  * 过滤规则的校验。
  *
  * 上限不是随手写的：`limit` 卡在 5000 是因为再多的节点会让生成的 YAML
@@ -130,7 +113,6 @@ const FilterRuleSchema = z.object({
   sort: z.enum(['none', 'name', 'region', 'type', 'source']).optional(),
   limit: z.number().int().min(0).max(5000).optional(),
   chain: ChainRuleSchema.optional(),
-  ix: IxRuleSchema.optional(),
 });
 
 const TARGET_VALUES = [
@@ -284,7 +266,7 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
         label: IX_AUTH_MODE_LABELS[value],
       })),
       ixStates: IX_STATES.map((value) => ({ value, label: IX_STATE_LABELS[value] })),
-      ixSyncIntervalHours: ctx.config.ixSyncIntervalHours,
+      ixSyncIntervalMinutes: ctx.config.ixSyncIntervalMinutes,
       /** 连续多少轮同步没见到节点就标孤儿。界面上"第 N/M 轮"要显示 M。 */
       ixOrphanThreshold: ctx.config.ixOrphanThreshold,
       /** 一次批量建映射的指纹上限。前端用它做同一份预检，别再硬编码一份。 */
@@ -298,9 +280,15 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
       // 全部节点只读一次。放在循环里读的话，每个配置文件都会触发一次
       // 全表扫描 + 每行一次 JSON.parse —— 5 个配置 × 2000 个节点就是
       // 一万次反序列化，而首屏每次刷新都要走这条路径。
-      const allNodes = ctx.nodes.listAll();
+      const allNodes = ctx.catalog.listAll();
       const friends = ctx.friends.list();
-      const tokens = ctx.tokens.listAll();
+      const base = ctx.config.publicBaseUrl.replace(/\/+$/, '');
+      const tokens = ctx.tokens.listAll().map((token) => ({
+        ...token,
+        // The profile-link modal is rendered from /state. Keep its token shape
+        // aligned with /tokens so the URL can be displayed and copied directly.
+        url: `${base}/sub/${token.token}`,
+      }));
       const snapshots = ctx.traffic.latestAll();
 
       const subscriptions = ctx.subscriptions.list().map((sub) => ({
@@ -313,7 +301,11 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
         // 顺带算出每个配置文件当前命中多少节点 —— 这是界面上最有用的一个数字，
         // 它直接回答"我这条链接现在能给出多少节点"
         matchedNodes: applyFilter(allNodes, profile.rule).stats.output,
-        outputNodes: expandChain(applyFilter(allNodes, profile.rule).nodes, profile.rule.chain).nodes.length,
+        outputNodes: expandChain(
+          applyFilter(allNodes, profile.rule).nodes,
+          profile.rule.chain,
+          allNodes,
+        ).nodes.length,
         tokenCount: tokens.filter((t) => t.profileId === profile.id && !t.revoked).length,
       }));
 
@@ -385,26 +377,34 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
     app.get('/nodes', async () => {
       // 只返回元信息，不含凭据 —— 见文件头部的说明
       const latestPings = ctx.pingHistory.latestAll();
-      return ctx.nodes.listAll().map((node) => ({
-        fingerprint: node.fingerprint,
-        name: node.name,
-        type: node.type,
-        server: node.server,
-        port: node.port,
-        region: node.meta.region ?? null,
-        sourceId: node.meta.sourceId,
-        sourceName: node.meta.sourceName,
-        tags: node.meta.tags,
-        firstSeen: node.firstSeen,
-        lastSeen: node.lastSeen,
-        ping: latestPings.get(node.fingerprint) ?? null,
+      return ctx.catalog.list().map((entry) => ({
+        fingerprint: entry.fingerprint,
+        name: entry.name,
+        type: entry.type,
+        server: entry.server,
+        port: entry.port,
+        region: entry.region,
+        sourceId: entry.sourceId,
+        sourceName: entry.sourceName,
+        tags: entry.tags,
+        firstSeen: entry.firstSeen,
+        lastSeen: entry.lastSeen,
+        kind: entry.kind,
+        usable: entry.usable,
+        originFingerprint: entry.originFingerprint ?? null,
+        providerId: entry.providerId ?? null,
+        relayState: entry.relayState ?? null,
+        relayError: entry.relayError ?? null,
+        ping: latestPings.get(entry.fingerprint) ?? null,
       }));
     });
 
     app.get<{ Params: { fingerprint: string } }>('/nodes/:fingerprint/uri', async (req, reply) => {
       // 一次只取一个节点的完整 URI。批量导出凭据不是这个接口的用途。
-      const node = ctx.nodes.listAll().find((n) => n.fingerprint === req.params.fingerprint);
-      if (!node) return reply.code(404).send({ error: '节点不存在' });
+      const entry = ctx.catalog.get(req.params.fingerprint);
+      if (!entry) return reply.code(404).send({ error: '节点不存在' });
+      if (!entry.node) return reply.code(409).send({ error: entry.relayError ?? 'IX 节点当前不可用' });
+      const node = entry.node;
 
       ctx.logger.info('导出单个节点 URI', {
         fingerprint: node.fingerprint,
@@ -420,8 +420,10 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
     // 出码在本地算（src/core/qrcode.ts），不经任何第三方服务 ——
     // 这条链接等同于节点的访问凭证，交出去一份就少一分。
     app.get<{ Params: { fingerprint: string } }>('/nodes/:fingerprint/qrcode', async (req, reply) => {
-      const node = ctx.nodes.listAll().find((n) => n.fingerprint === req.params.fingerprint);
-      if (!node) return reply.code(404).send({ error: '节点不存在' });
+      const entry = ctx.catalog.get(req.params.fingerprint);
+      if (!entry) return reply.code(404).send({ error: '节点不存在' });
+      if (!entry.node) return reply.code(409).send({ error: entry.relayError ?? 'IX 节点当前不可用' });
+      const node = entry.node;
 
       const uri = emitUri(node);
       if (uri === null) {
@@ -456,21 +458,23 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
     });
 
     app.get<{ Params: { fingerprint: string } }>('/nodes/:fingerprint/ping/history', async (req, reply) => {
-      const node = ctx.nodes.listAll().find((item) => item.fingerprint === req.params.fingerprint);
-      if (!node) return reply.code(404).send({ error: '节点不存在' });
+      const entry = ctx.catalog.get(req.params.fingerprint);
+      if (!entry) return reply.code(404).send({ error: '节点不存在' });
 
       const retentionDays = 90;
       return {
-        fingerprint: node.fingerprint,
+        fingerprint: entry.fingerprint,
         intervalHours: ctx.config.nodePingIntervalHours,
         retentionDays,
-        snapshots: ctx.pingHistory.history(node.fingerprint, Date.now() - retentionDays * 86400_000),
+        snapshots: ctx.pingHistory.history(entry.fingerprint, Date.now() - retentionDays * 86400_000),
       };
     });
 
     app.get<{ Params: { fingerprint: string } }>('/nodes/:fingerprint/ping', async (req, reply) => {
-      const node = ctx.nodes.listAll().find((item) => item.fingerprint === req.params.fingerprint);
-      if (!node) return reply.code(404).send({ error: '节点不存在' });
+      const entry = ctx.catalog.get(req.params.fingerprint);
+      if (!entry) return reply.code(404).send({ error: '节点不存在' });
+      if (!entry.node) return reply.code(409).send({ error: entry.relayError ?? 'IX 节点当前不可用' });
+      const node = entry.node;
 
       const result = await ctx.nodePing.pingNode(node);
       ctx.logger.info('节点 TCP 连通性测试完成', {
@@ -551,8 +555,6 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
         chain: rendered.chain,
         // 预览必须能解释"为什么这些节点还是直连" —— 少了这两个字段，
         // 用户在预览里只会看到节点数没变，看不到 IX 那一趟发生了什么
-        ix: rendered.ix,
-        ixSkipped: rendered.ixSkipped,
         warnings: rendered.warnings,
         skipped: rendered.skipped,
         target: rendered.target,
@@ -573,7 +575,7 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
     });
 
     // ── IX 中转 ───────────────────────────────────────
-    // 九个 `/api/ix/*` 路由在 routes/ix.ts（同前缀的独立插件）。见本文件头注释。
+    // `/api/ix/*` 路由在 routes/ix.ts（同前缀的独立插件）。见本文件头注释。
 
     // ── 订阅 token ────────────────────────────────────
     app.get('/tokens', async () => {

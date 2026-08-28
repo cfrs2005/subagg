@@ -24,8 +24,8 @@ export interface SchedulerOptions {
   nodePing?: NodePingService;
   /** IX 中转编排。省略 = 不做 IX 状态同步。 */
   ix?: IxService;
-  /** IX 状态同步间隔（小时）。0 或省略表示禁用。 */
-  ixSyncIntervalHours?: number;
+  /** IX 状态同步间隔（分钟）。0 或省略表示禁用。 */
+  ixSyncIntervalMinutes?: number;
 }
 
 export class Scheduler {
@@ -139,13 +139,13 @@ export class Scheduler {
    * **自带 try/catch，且排在订阅同步与节点探测之后。**中转平台是外部服务，
    * 它挂了、限流了、凭据过期了都不该影响 subagg 的主功能 ——
    * 而这一层同步失败的唯一后果是"映射状态旧了一轮"，
-   * 渲染仍然照本地映射工作（不可用的映射会让节点回落直连）。
+   * 派生节点保留最后入口并标记状态过期。
    */
   private async tickIx(): Promise<void> {
     const { ix, logger } = this.options;
-    const hours = this.options.ixSyncIntervalHours ?? 0;
-    if (!ix || hours <= 0) return;
-    if (Date.now() - this.lastIxSyncAt < hours * 3600_000) return;
+    const minutes = this.options.ixSyncIntervalMinutes ?? 0;
+    if (!ix || minutes <= 0) return;
+    if (Date.now() - this.lastIxSyncAt < minutes * 60_000) return;
 
     // 时间门在**发起前**推进：平台连续失败时不该变成每轮都重试的忙等
     this.lastIxSyncAt = Date.now();

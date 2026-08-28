@@ -1,5 +1,5 @@
 import type { Config } from '../config.js';
-import type { NodeRepo, StoredNode } from '../db/repo/nodes.js';
+import type { ProxyNode } from '../core/types.js';
 import type { PingHistoryRepo, PingSnapshot } from '../db/repo/ping-history.js';
 import type { Logger } from '../logger.js';
 import { pingHostPort } from './tcpPing.js';
@@ -13,9 +13,14 @@ export interface NodePingResult extends PingSnapshot {
 export class NodePingService {
   private running = false;
 
-  constructor(private readonly options: { config: Config; logger: Logger; nodes: NodeRepo; history: PingHistoryRepo }) {}
+  constructor(private readonly options: {
+    config: Config;
+    logger: Logger;
+    nodes: { listAll(): ProxyNode[] };
+    history: PingHistoryRepo;
+  }) {}
 
-  async pingNode(node: StoredNode): Promise<NodePingResult> {
+  async pingNode(node: ProxyNode): Promise<NodePingResult> {
     const result = await pingHostPort(node.server, node.port);
     const snapshot = this.options.history.record({
       fingerprint: node.fingerprint,

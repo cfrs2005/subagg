@@ -49,7 +49,7 @@ export interface IxProvider {
    * 用户在平台上手工关掉某个端口的 UDP 时我们完全看不到。
    */
   enableUdp: boolean;
-  /** 全局总闸。关掉后所有 profile 一起回落直连。 */
+  /** Provider 总闸。关掉后其 IX 派生节点标记为不可用。 */
   enabled: boolean;
   lastProbeAt: number | null;
   lastError: string | null;
@@ -247,7 +247,7 @@ const MAPPING_STATES = ['pending', 'active', 'error', 'orphan'] as const satisfi
 
 export interface IxMapping {
   providerId: string;
-  /** 原节点指纹。改写发生在渲染期且保留原指纹，所以这里永远是原始节点的。 */
+  /** 原节点指纹。派生指纹由 provider id 与此字段稳定计算。 */
   fingerprint: string;
   remotePortId: number | null;
   /** 中转入口。端口由平台分配，建成前是 null（不用 0 —— 那是能混进配置的假值）。 */
@@ -477,6 +477,18 @@ export class IxMappingRepo {
     return rows.map(toMapping);
   }
 
+  /** All local relay projections that share one remote IX port. */
+  listByRemotePort(providerId: string, remotePortId: number): IxMapping[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM ix_port_mappings
+         WHERE provider_id = ? AND remote_port_id = ?
+         ORDER BY created_at ASC`,
+      )
+      .all(providerId, remotePortId) as MappingRow[];
+    return rows.map(toMapping);
+  }
+
   /** 按状态筛（孤儿高亮、待创建队列）。走 idx_ix_map_state。 */
   listByState(state: IxMappingState, providerId?: string): IxMapping[] {
     const rows = (
@@ -581,6 +593,11 @@ export class IxMappingRepo {
          WHERE provider_id = ? AND fingerprint = ? AND missing_count <> 0`,
       )
       .run(now, providerId, fingerprint);
+  }
+
+  /** Run a reconciliation batch atomically so subscriptions never see half-updated entry domains. */
+  transaction<T>(work: () => T): T {
+    return this.db.transaction(work)();
   }
 
   delete(providerId: string, fingerprint: string): boolean {

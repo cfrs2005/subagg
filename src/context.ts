@@ -6,10 +6,11 @@
  * "这个函数依赖什么"在签名上一目了然，也让测试时替换某个仓储变得毫不费力。
  */
 
-import type { Config } from './config.js';
+import { googleAuthEnabled, type Config } from './config.js';
 import { deriveKey } from './core/secret.js';
 import { openDatabase, type Db } from './db/index.js';
 import { IxMappingRepo, IxProviderRepo } from './db/repo/ix.js';
+import { AuthRepo } from './db/repo/auth.js';
 import { NodeRepo } from './db/repo/nodes.js';
 import { PingHistoryRepo } from './db/repo/ping-history.js';
 import { ProfileRepo } from './db/repo/profiles.js';
@@ -17,9 +18,11 @@ import { AccessLogRepo, FriendRepo, TokenRepo } from './db/repo/sharing.js';
 import { SubscriptionRepo, TrafficRepo } from './db/repo/subscriptions.js';
 import type { Logger } from './logger.js';
 import { IxService } from './services/ix.js';
+import { GoogleOidcService } from './services/google-oidc.js';
 import { LimitStats } from './services/limit-stats.js';
 import { Scheduler } from './services/scheduler.js';
 import { NodePingService } from './services/node-ping.js';
+import { NodeCatalog } from './services/node-catalog.js';
 import { SyncService } from './services/sync.js';
 
 export interface AppContext {
@@ -34,6 +37,7 @@ export interface AppContext {
   friends: FriendRepo;
   tokens: TokenRepo;
   accessLog: AccessLogRepo;
+  auth: AuthRepo;
   pingHistory: PingHistoryRepo;
   ixProviders: IxProviderRepo;
   ixMappings: IxMappingRepo;
@@ -41,6 +45,8 @@ export interface AppContext {
   sync: SyncService;
   nodePing: NodePingService;
   ix: IxService;
+  catalog: NodeCatalog;
+  googleOidc: GoogleOidcService | null;
   scheduler: Scheduler;
   /** 限流命中计数。进程内，重启清零 —— 展示时必须带上 since。 */
   limitStats: LimitStats;
@@ -57,18 +63,18 @@ export function createContext(config: Config, logger: Logger): AppContext {
   const friends = new FriendRepo(db);
   const tokens = new TokenRepo(db);
   const accessLog = new AccessLogRepo(db);
+  const auth = new AuthRepo(db);
   const pingHistory = new PingHistoryRepo(db);
   const ixProviders = new IxProviderRepo(db);
   const ixMappings = new IxMappingRepo(db);
 
   const limitStats = new LimitStats();
   const sync = new SyncService({ config, logger, subscriptions, nodes, traffic });
-  const nodePing = new NodePingService({ config, logger, nodes, history: pingHistory });
   // 凭据加密密钥在这里派生**一次**：scrypt 是刻意慢的，放进每次加解密就等于
   // 给每个管理请求加上几十毫秒。core/secret.ts 收密钥当参数，正是为了让
   // "密钥从哪来"留在装配层（core 零 IO，不读环境变量）。
   // 代价写在文档里：轮换 ADMIN_TOKEN 后已存的 IX 凭据永久解不开，
-  // 届时 provider 会被标成"需重新录入"并回落直连，不会崩。
+  // 届时 provider 会被标成"需重新录入"，关联 IX 节点不可用，服务不会崩。
   const secretKey = deriveKey(config.adminToken);
   const ix = new IxService({
     config,
@@ -78,6 +84,11 @@ export function createContext(config: Config, logger: Logger): AppContext {
     nodes,
     secretKey,
   });
+  const catalog = new NodeCatalog(nodes, ix);
+  const nodePing = new NodePingService({ config, logger, nodes: catalog, history: pingHistory });
+  const googleOidc = googleAuthEnabled(config)
+    ? new GoogleOidcService(config.googleClientId!, config.googleClientSecret!)
+    : null;
   const scheduler = new Scheduler({
     intervalMinutes: config.schedulerIntervalMin,
     logger,
@@ -86,7 +97,7 @@ export function createContext(config: Config, logger: Logger): AppContext {
     accessLogRetentionDays: config.accessLogRetentionDays,
     nodePing,
     ix,
-    ixSyncIntervalHours: config.ixSyncIntervalHours,
+    ixSyncIntervalMinutes: config.ixSyncIntervalMinutes,
   });
 
   return {
@@ -100,12 +111,15 @@ export function createContext(config: Config, logger: Logger): AppContext {
     friends,
     tokens,
     accessLog,
+    auth,
     pingHistory,
     ixProviders,
     ixMappings,
     sync,
     nodePing,
     ix,
+    catalog,
+    googleOidc,
     scheduler,
     limitStats,
   };
