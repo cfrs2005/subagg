@@ -483,21 +483,24 @@ function parseGeneralLine(line: string, state: GeneralState, warnings: string[])
 // ─────────────────────────────────────────────────────────────
 
 /**
- * Shadowrocket 的 `url-test` 支持 `policy-select-name`（优先某台，挂了再自动）。
- * Clash 的 url-test 永远选最低延迟，没有这个字段。
+ * Shadowrocket / Surge 的自动组（url-test / fallback / load-balance）都允许
+ * 在界面里**手动指定节点**，指定后优先使用、失败再回到自动；Clash 的
+ * 同名类型却是纯自动、完全不可点选。直接照抄类型，用户在客户端里会觉得
+ * "所有分组都点不动"。
  *
- * 忠实翻译只有一种做法：把原来的组降级成内层 url-test，外面再包一层
- * select，首选节点放第一个。这样规则仍然指向原组名，行为却对上了。
+ * 忠实且可用的翻译是：外层 `select`（首个成员 = 首选节点，可任意切换）
+ * + 内层 `<name>-AUTO`（保留原类型与测速参数）。规则仍指向原组名，
+ * 默认行为仍是"首选优先"，想交给自动时点内层组即可。
+ *
+ * 注：`policy-regex-filter` / `include-all-proxies` 这类选项在 select 外层
+ * 不需要重复，成员已经解析成真实节点。
  */
-function wrapPreferredUrlTest(
-  groups: OrchestrationGroup[],
-  warnings: string[],
-): OrchestrationGroup[] {
+function wrapAutoGroups(groups: OrchestrationGroup[], warnings: string[]): OrchestrationGroup[] {
   const names = new Set(groups.map((group) => group.name));
   const out: OrchestrationGroup[] = [];
 
   for (const group of groups) {
-    if (group.type !== 'url-test' || !group.preferred?.length) {
+    if (group.type === 'select') {
       out.push(group);
       continue;
     }
@@ -507,24 +510,23 @@ function wrapPreferredUrlTest(
       autoName = `${group.name}-AUTO-${index}`;
     }
 
+    // 外层：原成员（preferred 会被解析器提前）+ 自动子组。
     out.push({
       name: group.name,
       type: 'select',
-      members: [
-        ...group.preferred.map(exactNameSelector),
-        { kind: 'group', name: autoName },
-      ],
+      members: [...group.members, { kind: 'group', name: autoName }],
+      ...(group.preferred?.length ? { preferred: [...group.preferred] } : {}),
     });
+    // 内层：保留原类型、测速参数与成员（preferred 只属于外层）。
     out.push({
       ...group,
       name: autoName,
       preferred: undefined,
-      type: 'url-test',
     });
 
     names.add(autoName);
     warnings.push(
-      `分组「${group.name}」的 policy-select-name 已翻译为：外层 select（首选在前）+ 内层 url-test「${autoName}」`,
+      `分组「${group.name}」原为 ${group.type}（Clash 中不可手动切换），已翻译为外层 select + 内层自动组「${autoName}」`,
     );
   }
 
@@ -719,7 +721,7 @@ export function parseShadowrocketConf(text: string): ShadowrocketImportResult {
     );
   }
 
-  orchestration.groups = wrapPreferredUrlTest(orchestration.groups, warnings);
+  orchestration.groups = wrapAutoGroups(orchestration.groups, warnings);
   ensureGroups(orchestration, warnings);
 
   return { orchestration, warnings };

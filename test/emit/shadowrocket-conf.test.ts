@@ -90,6 +90,40 @@ describe('emitShadowrocketConf', () => {
     expect(result.nodeCount).toBe(2);
   });
 
+  it('把 Clash 侧 select + -AUTO 包装还原成 Shadowrocket 原生自动组', () => {
+    const wrapped: Orchestration = {
+      groups: [
+        {
+          name: 'GOOGLE',
+          type: 'select',
+          members: [
+            { kind: 'nodes', select: { nameRegex: '^DMIT-VIA-US-LOS-CG$' } },
+            { kind: 'group', name: 'GOOGLE-AUTO' },
+          ],
+          preferred: ['DMIT-VIA-US-LOS-CG'],
+        },
+        {
+          name: 'GOOGLE-AUTO',
+          type: 'fallback',
+          members: [{ kind: 'nodes', select: { nameRegex: '^DMIT-VIA-US-LOS-CG$' } }],
+          url: 'http://www.gstatic.com/generate_204',
+          interval: 600,
+        },
+      ],
+      rules: [{ type: 'MATCH', policy: 'GOOGLE' }],
+    };
+
+    const result = emitShadowrocketConf(
+      nodes.filter((node) => node.name === 'DMIT-VIA-US-LOS-CG'),
+      { orchestration: wrapped },
+    );
+
+    expect(result.body).toContain(
+      'GOOGLE = fallback,DMIT-VIA-US-LOS-CG,policy-select-name=DMIT-VIA-US-LOS-CG,url=http://www.gstatic.com/generate_204,interval=600',
+    );
+    expect(result.body).not.toContain('GOOGLE-AUTO');
+  });
+
   it('没有编排时输出最小可用 conf', () => {
     const result = emitShadowrocketConf(nodes, {});
 

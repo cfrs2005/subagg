@@ -363,13 +363,22 @@ describe('内置预设', () => {
 
     const resolved = resolveOrchestration(prodLike, IOS_MIGRATED);
 
-    // GOOGLE 只含 conf 里点名的两台 —— 不是所有 DMIT-*。
+    // GOOGLE 外层 select（可手动切换）只含 conf 点名的两台 + 自动子组 —— 不是所有 DMIT-*。
     const google = resolved.groups.find((group) => group.name === 'GOOGLE');
-    expect(google?.proxies).toEqual(['DMIT-via-US-LOS-CG', 'DMIT-ss2022']);
+    expect(google?.type).toBe('select');
+    expect(google?.proxies).toEqual(['DMIT-via-US-LOS-CG', 'DMIT-ss2022', 'GOOGLE-AUTO']);
+    const googleAuto = resolved.groups.find((group) => group.name === 'GOOGLE-AUTO');
+    expect(googleAuto?.type).toBe('fallback');
+    expect(googleAuto?.proxies).toEqual(['DMIT-via-US-LOS-CG', 'DMIT-ss2022']);
 
-    // AI-CLAUDE：首选在前 + 内层 url-test 精确三台。
+    // AI-CLAUDE：首选在前 + 其余精确成员 + 内层 url-test。
     const claude = resolved.groups.find((group) => group.name === 'AI-CLAUDE');
-    expect(claude?.proxies).toEqual(['verizon-via-bwg', 'AI-CLAUDE-AUTO']);
+    expect(claude?.proxies).toEqual([
+      'verizon-via-bwg',
+      'verizon-via-txsh',
+      'verizon-via-dmit',
+      'AI-CLAUDE-AUTO',
+    ]);
     const claudeAuto = resolved.groups.find((group) => group.name === 'AI-CLAUDE-AUTO');
     expect(claudeAuto?.proxies).toEqual(['verizon-via-bwg', 'verizon-via-txsh', 'verizon-via-dmit']);
 

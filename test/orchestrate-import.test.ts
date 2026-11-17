@@ -67,11 +67,15 @@ describe('parseShadowrocketConf', () => {
   it('解析分组、规则、DNS 与 skip-proxy', () => {
     const { orchestration, warnings } = parseShadowrocketConf(SAMPLE);
 
+    // 自动组（fallback/url-test）在 Clash 里不可手动切换，统一翻成
+    // 外层 select + 内层 <name>-AUTO，外层保留首选顺序。
     const google = orchestration.groups.find((group) => group.name === 'GOOGLE');
-    expect(google?.type).toBe('fallback');
+    expect(google?.type).toBe('select');
     expect(google?.preferred).toEqual(['DMIT-VIA-US-LOS-CG']);
-    expect(google?.url).toBe('http://www.gstatic.com/generate_204');
-    expect(google?.interval).toBe(600);
+    const googleAuto = orchestration.groups.find((group) => group.name === 'GOOGLE-AUTO');
+    expect(googleAuto?.type).toBe('fallback');
+    expect(googleAuto?.url).toBe('http://www.gstatic.com/generate_204');
+    expect(googleAuto?.interval).toBe(600);
 
     const claude = orchestration.groups.find((group) => group.name === 'AI-CLAUDE');
     expect(claude?.type).toBe('select');
@@ -124,7 +128,7 @@ describe('parseShadowrocketConf', () => {
 
     // 明确告诉用户哪些东西没迁移过去。
     expect(warnings.some((warning) => warning.includes('extended-matching'))).toBe(true);
-    expect(warnings.some((warning) => warning.includes('policy-select-name 已翻译'))).toBe(true);
+    expect(warnings.some((warning) => warning.includes('已翻译为外层 select'))).toBe(true);
     expect(warnings.some((warning) => warning.includes('USER-AGENT'))).toBe(true);
     expect(warnings.some((warning) => warning.includes('GitHub 网页地址'))).toBe(true);
     expect(warnings.some((warning) => warning.includes('dns-server 支持 #proxy'))).toBe(true);
@@ -139,10 +143,16 @@ describe('parseShadowrocketConf', () => {
     );
 
     const google = resolved.groups.find((group) => group.name === 'GOOGLE');
-    expect(google?.proxies).toEqual(['DMIT-VIA-US-LOS-CG', 'DMIT-SS2022']);
+    expect(google?.proxies).toEqual(['DMIT-VIA-US-LOS-CG', 'DMIT-SS2022', 'GOOGLE-AUTO']);
+    const googleAuto = resolved.groups.find((group) => group.name === 'GOOGLE-AUTO');
+    expect(googleAuto?.proxies).toEqual(['DMIT-VIA-US-LOS-CG', 'DMIT-SS2022']);
 
     const claude = resolved.groups.find((group) => group.name === 'AI-CLAUDE');
-    expect(claude?.proxies).toEqual(['VERIZON-VIA-BWG', 'AI-CLAUDE-AUTO']);
+    expect(claude?.proxies).toEqual([
+      'VERIZON-VIA-BWG',
+      'VERIZON-VIA-TXSH',
+      'AI-CLAUDE-AUTO',
+    ]);
     const claudeAuto = resolved.groups.find((group) => group.name === 'AI-CLAUDE-AUTO');
     expect(claudeAuto?.proxies).toEqual(['VERIZON-VIA-BWG', 'VERIZON-VIA-TXSH']);
 
@@ -178,9 +188,11 @@ describe('parseShadowrocketConf', () => {
     );
 
     const auto = orchestration.groups.find((group) => group.name === 'AUTO');
+    expect(auto?.type).toBe('select');
     expect(auto?.members).toEqual([
       { kind: 'nodes', select: {} },
       { kind: 'nodes', select: { nameRegex: '^VERIZON-' } },
+      { kind: 'group', name: 'AUTO-AUTO' },
     ]);
     expect(orchestration.rules.some((rule) => rule.type === 'DOMAIN-REGEX')).toBe(true);
   });

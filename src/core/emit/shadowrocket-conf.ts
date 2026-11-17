@@ -84,7 +84,50 @@ export function emitShadowrocketConf(
     warnings.push(...resolved.warnings);
 
     // ── [Proxy Group] ────────────────────────────────
+    //
+    // Clash 侧为了"可手动切换"会把自动组包成 select + `<name>-AUTO`；
+    // Shadowrocket 原生支持 url-test/fallback + policy-select-name，
+    // 所以这里把包装形态还原回单组，保持与用户原 conf 一致。
+    const groupByName = new Map(resolved.groups.map((group) => [group.name, group]));
+    const consumed = new Set<string>();
+
     for (const group of resolved.groups) {
+      if (consumed.has(group.name)) continue;
+
+      if (group.type === 'select') {
+        const autoRef = group.proxies.find((member) => {
+          const candidate = groupByName.get(member);
+          return (
+            candidate !== undefined &&
+            candidate.type !== 'select' &&
+            member.startsWith(`${group.name}-AUTO`)
+          );
+        });
+        const auto = autoRef ? groupByName.get(autoRef) : undefined;
+
+        if (auto) {
+          const members = group.proxies.filter((member) => member !== autoRef);
+          const coversAll =
+            members.length > 0 &&
+            members.every((member) => member === 'DIRECT' || auto.proxies.includes(member));
+
+          if (coversAll) {
+            const groupOptions: string[] = [];
+            // 首个成员就是解析器排好的首选节点。
+            if (!groupByName.has(members[0] ?? '') && members[0] !== 'DIRECT') {
+              groupOptions.push(`policy-select-name=${members[0]}`);
+            }
+            if (auto.url) groupOptions.push(`url=${auto.url}`);
+            if (auto.interval !== undefined) groupOptions.push(`interval=${auto.interval}`);
+            if (auto.tolerance !== undefined) groupOptions.push(`tolerance=${auto.tolerance}`);
+
+            groups.push(formatGroup(group.name, auto.type, members, groupOptions));
+            consumed.add(auto.name);
+            continue;
+          }
+        }
+      }
+
       const members = group.proxies.filter((member) => {
         if (safeToken(member)) return true;
         warnings.push(`分组「${group.name}」的成员「${member}」含逗号，已剔除`);
