@@ -175,13 +175,19 @@ describe('配置文件编排端到端', () => {
     expect(clash.statusCode).toBe(200);
 
     const config = parseYaml(clash.body) as Record<string, unknown>;
-    expect(config['proxy-groups']).toEqual([
-      { name: 'AI-OPENAI', type: 'select', proxies: ['GANBEI-VIA-TXSH'] },
-      {
-        name: 'PROXY',
-        type: 'select',
-        proxies: ['DMIT-VIA-US-LOS-CG', 'GANBEI-VIA-TXSH'],
+    // 节点不再内联：配置里只有节点源地址，成员由客户端 filter 求值。
+    expect(config['proxies']).toBeUndefined();
+    expect(config['proxy-providers']).toMatchObject({
+      subagg: {
+        type: 'http',
+        url: `http://127.0.0.1:8787/sub/${token}?target=clash.provider`,
+        path: './providers/subagg.yaml',
       },
+    });
+    expect(config['proxy-groups']).toEqual([
+      { name: 'AI-OPENAI', type: 'select', use: ['subagg'], filter: '(?i:GANBEI)' },
+      // 无名字约束的选择器 = 全部节点，所以只有 use，没有 filter。
+      { name: 'PROXY', type: 'select', use: ['subagg'] },
     ]);
     expect(config['rules']).toEqual([
       'DOMAIN-SUFFIX,gs-robot.com,DIRECT',
@@ -238,7 +244,82 @@ describe('配置文件编排端到端', () => {
     expect(groups).not.toContain('节点选择');
   });
 
-  it('全局默认编排：设置后对所有未单独编排的 profile 生效，且 profile 优先', async () => {
+  it('?style=inline 退回自包含配置（逃生舱）', async () => {
+    const { app } = await setup();
+    const profileId = await createProfile(app);
+    const token = await createToken(app, profileId);
+
+    const clash = await app.inject({
+      method: 'GET',
+      url: `/sub/${token}?style=inline`,
+      headers: { 'user-agent': 'clash-verge/v2.2.0' },
+    });
+
+    const config = parseYaml(clash.body) as Record<string, unknown>;
+    expect(config['proxy-providers']).toBeUndefined();
+    expect(Array.isArray(config['proxies'])).toBe(true);
+    expect(config['proxy-groups']).toEqual([
+      { name: 'AI-OPENAI', type: 'select', proxies: ['GANBEI-VIA-TXSH'] },
+      {
+        name: 'PROXY',
+        type: 'select',
+        proxies: ['DMIT-VIA-US-LOS-CG', 'GANBEI-VIA-TXSH'],
+      },
+    ]);
+  });
+
+  it('节点源端点只输出 proxies，且与订阅用同一套过滤', async () => {
+    const { app } = await setup();
+    const profileId = await createProfile(app);
+    const token = await createToken(app, profileId);
+
+    const provider = await app.inject({
+      method: 'GET',
+      url: `/sub/${token}?target=clash.provider`,
+    });
+    expect(provider.statusCode).toBe(200);
+
+    const body = parseYaml(provider.body) as Record<string, unknown>;
+    expect(Object.keys(body)).toEqual(['proxies']);
+    expect((body['proxies'] as Array<{ name: string }>).map((p) => p.name)).toEqual([
+      'DMIT-VIA-US-LOS-CG',
+      'GANBEI-VIA-TXSH',
+    ]);
+  });
+
+  it('告警里出现非 BMP 字符（emoji）时响应头不会把订阅打成 500', async () => {
+    const { app } = await setup();
+
+    // 规则指向具体节点 → 节点源模式下会生成「🔒 节点名」分组并产生告警。
+    // 逐字符百分号编码会把代理对劈成两半，encodeURIComponent 抛 URI malformed，
+    // 整个订阅变 500 —— 一个诊断头把主功能搞挂。
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/profiles',
+      headers: AUTH,
+      payload: {
+        name: 'emoji 告警',
+        rule: { useDefaultExclude: false },
+        orchestration: {
+          groups: [{ name: 'PROXY', type: 'select', members: [{ kind: 'nodes', select: {} }] }],
+          rules: [
+            { type: 'DOMAIN-SUFFIX', value: 'drleao.cn', policy: 'DMIT-VIA-US-LOS-CG' },
+            { type: 'MATCH', policy: 'PROXY' },
+          ],
+        },
+      },
+    });
+    const token = await createToken(app, (created.json() as { id: string }).id);
+
+    const clash = await app.inject({
+      method: 'GET',
+      url: `/sub/${token}`,
+      headers: { 'user-agent': 'clash-verge/v2.2.0' },
+    });
+
+    expect(clash.statusCode).toBe(200);
+    expect(clash.headers['x-subagg-warning']).toContain('%F0%9F%94%92');
+  });  it('全局默认编排：设置后对所有未单独编排的 profile 生效，且 profile 优先', async () => {
     const { app } = await setup();
     const profileId = await createProfile(app);
     const token = await createToken(app, profileId);

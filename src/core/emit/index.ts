@@ -21,7 +21,7 @@
  */
 
 import type { ProxyNode } from '../types.js';
-import { emitClash, type ClashEmitOptions } from './clash.js';
+import { emitClash, emitClashProvider, type ClashEmitOptions } from './clash.js';
 import { emitShadowrocket, emitV2Ray } from './urilist.js';
 import { emitShadowrocketConf, type ShadowrocketConfOptions } from './shadowrocket-conf.js';
 import {
@@ -33,7 +33,9 @@ import {
 
 export {
   EMIT_TARGETS,
+  INTERNAL_TARGETS,
   TARGET_LABELS,
+  UI_TARGETS,
   isEmitTarget,
   checkSupport,
   partitionBySupport,
@@ -43,7 +45,7 @@ export {
   chainMechanismFor,
   type ChainMechanism,
 } from './capability.js';
-export { emitClash, toClashProxy, type ClashEmitOptions } from './clash.js';
+export { emitClash, emitClashProvider, toClashProxy, type ClashEmitOptions } from './clash.js';
 export { emitShadowrocket, emitV2Ray } from './urilist.js';
 export { emitShadowrocketConf, type ShadowrocketConfOptions } from './shadowrocket-conf.js';
 export { emitUri } from './uri.js';
@@ -246,6 +248,11 @@ export function normalizeTargetAlias(input: string): EmitTarget | undefined {
     case 'sr':
     case 'rocket':
       return 'shadowrocket';
+    case 'provider':
+    case 'clashprovider':
+    case 'clash-provider':
+    case 'proxies':
+      return 'clash.provider';
     case 'conf':
     case 'srconf':
     case 'sr-conf':
@@ -289,6 +296,8 @@ export function emit(
     case 'clash':
     case 'clash.meta':
       return emitClash(nodes, { ...options.clash, target });
+    case 'clash.provider':
+      return emitClashProvider(nodes, { target: 'clash.meta' });
     case 'shadowrocket':
       return emitShadowrocket(nodes, options.base64 ?? true);
     case 'shadowrocket.conf':
@@ -300,7 +309,7 @@ export function emit(
 
 /** 目标格式对应的文件扩展名，用于 Content-Disposition。 */
 export function fileExtensionFor(target: EmitTarget): string {
-  if (target === 'clash' || target === 'clash.meta') return 'yaml';
+  if (target === 'clash' || target === 'clash.meta' || target === 'clash.provider') return 'yaml';
   if (target === 'shadowrocket.conf') return 'conf';
   return 'txt';
 }

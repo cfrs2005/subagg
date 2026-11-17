@@ -28,15 +28,37 @@ import type { ProxyNode, ProxyType } from '../types.js';
  * `clash` 与 `clash.meta` 分开，是因为两者的协议支持差异巨大 ——
  * 这是整个矩阵里最有价值的一条区分。
  */
-export type EmitTarget = 'clash' | 'clash.meta' | 'shadowrocket' | 'shadowrocket.conf' | 'v2ray';
+export type EmitTarget =
+  | 'clash'
+  | 'clash.meta'
+  | 'clash.provider'
+  | 'shadowrocket'
+  | 'shadowrocket.conf'
+  | 'v2ray';
 
 export const EMIT_TARGETS: readonly EmitTarget[] = [
   'clash',
   'clash.meta',
+  'clash.provider',
   'shadowrocket',
   'shadowrocket.conf',
   'v2ray',
 ] as const;
+
+/**
+ * 只供内部端点使用、不该出现在界面下拉里、也不该作为默认目标的值。
+ *
+ * `clash.provider` 是 `proxy-providers[].url` 指向的节点源，用户不会主动选它，
+ * 选错了也只会得到一份没有分组的配置。
+ */
+export const INTERNAL_TARGETS: ReadonlySet<EmitTarget> = new Set<EmitTarget>([
+  'clash.provider',
+]);
+
+/** 界面上真正该列出来的目标：除内部端点之外的全部。 */
+export const UI_TARGETS = EMIT_TARGETS.filter(
+  (target): target is Exclude<EmitTarget, 'clash.provider'> => !INTERNAL_TARGETS.has(target),
+);
 
 export function isEmitTarget(v: string): v is EmitTarget {
   return (EMIT_TARGETS as readonly string[]).includes(v);
@@ -46,6 +68,7 @@ export function isEmitTarget(v: string): v is EmitTarget {
 export const TARGET_LABELS: Readonly<Record<EmitTarget, string>> = {
   clash: 'Clash（原版内核）',
   'clash.meta': 'Clash.Meta / mihomo',
+  'clash.provider': 'Clash.Meta 节点源（proxy-providers）',
   shadowrocket: 'Shadowrocket',
   'shadowrocket.conf': 'Shadowrocket 配置文件（.conf）',
   v2ray: 'V2Ray / v2rayN',
@@ -62,6 +85,17 @@ const SUPPORTED_TYPES: Readonly<Record<EmitTarget, ReadonlySet<ProxyType>>> = {
   clash: new Set<ProxyType>(['ss', 'ssr', 'vmess', 'trojan']),
   // mihomo：目前支持我们解析的全部协议
   'clash.meta': new Set<ProxyType>(['ss', 'ssr', 'vmess', 'vless', 'trojan', 'hysteria2', 'tuic']),
+  // 节点源与 clash.meta 同内核，能力矩阵必须一致 —— 否则配置里引用的节点
+  // 会因为这个过滤而少几个，group 的 filter 就会落空。
+  'clash.provider': new Set<ProxyType>([
+    'ss',
+    'ssr',
+    'vmess',
+    'vless',
+    'trojan',
+    'hysteria2',
+    'tuic',
+  ]),
   // Shadowrocket：协议覆盖很全，SSR 也原生支持
   shadowrocket: new Set<ProxyType>([
     'ss',
@@ -93,6 +127,7 @@ export type ChainMechanism = 'none' | 'shadowrocket-chain' | 'dialer-proxy';
 const CHAIN_MECHANISM: Readonly<Record<EmitTarget, ChainMechanism>> = {
   clash: 'none',
   'clash.meta': 'dialer-proxy',
+  'clash.provider': 'dialer-proxy',
   shadowrocket: 'shadowrocket-chain',
   'shadowrocket.conf': 'shadowrocket-chain',
   v2ray: 'none',
@@ -100,6 +135,7 @@ const CHAIN_MECHANISM: Readonly<Record<EmitTarget, ChainMechanism>> = {
 const CHAINABLE_TYPES: Readonly<Record<EmitTarget, ReadonlySet<ProxyType>>> = {
   clash: new Set(),
   'clash.meta': new Set(['ss', 'ssr', 'vmess', 'vless', 'trojan']),
+  'clash.provider': new Set(['ss', 'ssr', 'vmess', 'vless', 'trojan']),
   shadowrocket: new Set(['ss', 'vmess', 'vless', 'trojan']),
   'shadowrocket.conf': new Set(['ss', 'vmess', 'vless', 'trojan']),
   v2ray: new Set(),
@@ -141,7 +177,7 @@ export function checkSupport(node: ProxyNode, target: EmitTarget): SupportCheck 
 
   // ── 传输层检查 ──────────────────────────────────────
   if ('transport' in node && node.transport.network === 'quic') {
-    if (target === 'clash' || target === 'clash.meta') {
+    if (target === 'clash' || target === 'clash.meta' || target === 'clash.provider') {
       return {
         supported: false,
         reason: 'QUIC 传输：Clash 内核已移除对 VMess/VLESS over QUIC 的支持',

@@ -6,6 +6,20 @@
 ## [Unreleased]
 
 ### Added
+- Clash.Meta output now ships as a **node source** instead of an inline node list:
+  the config carries a `proxy-providers` entry pointing at
+  `?target=clash.provider`, and group membership is expressed as `use` + `filter`.
+  Renamed airport nodes are picked up by the client's own filter evaluation, so
+  the config does not have to be re-rendered (and manually pinned choices are not
+  invalidated) when a provider renames its nodes. `?style=inline` restores the
+  self-contained output for clients that misbehave with providers.
+- `?target=clash.provider` emits a `proxies:`-only document for
+  `proxy-providers[].url`. It is excluded from the UI target list and never
+  selected by User-Agent sniffing.
+- Rules that target a specific node are rewritten to an auto-generated
+  `🔒 <node>` group. Provider nodes are not part of the global proxy pool, so a
+  rule naming one directly makes mihomo refuse the whole config
+  (`proxy [X] not found`).
 - Rule-set translation endpoint `GET /r/:token/:key`. Rule sets are fetched and
   normalised server-side, so `rule-providers[].url` always points at a format the
   target `behavior` actually understands. Shadowrocket's leading-dot lists
@@ -25,6 +39,11 @@
   lucky `hosts:` entry or create a resolution loop.
 
 ### Fixed
+- A warning containing characters outside the BMP (any emoji, e.g. the generated
+  `🔒` group name) used to percent-encode each UTF-16 code unit separately, so
+  half a surrogate pair reached `encodeURIComponent`, which throws
+  `URI malformed` — one diagnostic header turned the whole subscription into a
+  500. Non-ASCII runs are now encoded as a whole.
 - `rule-providers` without an explicit `format` were parsed as YAML by mihomo,
   silently producing an **empty** rule set. Every rule set declared in
   orchestration now emits `format: text` unless another format is requested.

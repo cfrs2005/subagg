@@ -23,6 +23,7 @@
 import { stringify as stringifyYaml } from 'yaml';
 import { regionNameZh, regionToFlag } from '../region.js';
 import {
+  PROVIDER_NAME,
   resolveOrchestration,
   type Orchestration,
   type OrchestrationProvider,
@@ -57,6 +58,16 @@ export interface ClashEmitOptions {
    * 不给则保留原始 URL —— 预览路径就是这样，输出与线上会差这一点。
    */
   ruleProxyBase?: string;
+  /**
+   * 节点源地址（`?target=clash.provider` 的完整 URL）。
+   *
+   * 给出后配置切成 provider 模式：节点不再内联进 `proxies:`，而是由客户端
+   * 定期拉取，分组成员写成 `use` + `filter`。机场改名时 filter 在客户端
+   * 重新求值，配置一行不用改 —— 这是 inline 模式做不到的。
+   *
+   * 不给则保持内联（预览、`.conf`、以及 `?style=inline` 的逃生舱）。
+   */
+  nodeProviderUrl?: string;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -459,7 +470,11 @@ export function emitClash(nodes: readonly ProxyNode[], options: ClashEmitOptions
       const spec = options.ruleProxyBase
         ? localizeProviders(options.orchestration, options.ruleProxyBase)
         : options.orchestration;
-      orchestration = resolveOrchestration(usable, spec);
+      // 节点源模式下分组成员由客户端的 filter 求值：改名免疫，
+      // 也不会因为服务端某次渲染把名单拍死而丢掉用户的手动选择。
+      orchestration = resolveOrchestration(usable, spec, {
+        providerMode: Boolean(options.nodeProviderUrl),
+      });
 
       // 规则集下载必须直连。规则集就在我们自己的域名下，而"用规则决定怎么
       // 下载规则"是死锁：首次启动规则集为空，下载请求会一路走到 MATCH，
@@ -493,10 +508,36 @@ export function emitClash(nodes: readonly ProxyNode[], options: ClashEmitOptions
   if (orchestration?.ipv6 !== undefined) config['ipv6'] = orchestration.ipv6;
   if (orchestration?.hosts) config['hosts'] = orchestration.hosts;
 
-  config['proxies'] = usable.map(toClashProxy);
+  if (!options.nodeProviderUrl) {
+    config['proxies'] = usable.map(toClashProxy);
+  } else {
+    // 节点源。客户端按 interval 自己拉，配置本身不再是节点快照 ——
+    // 机场改名、增删节点，配置一个字都不用变。
+    config['proxy-providers'] = {
+      [PROVIDER_NAME]: {
+        type: 'http',
+        url: options.nodeProviderUrl,
+        path: `./providers/${PROVIDER_NAME}.yaml`,
+        interval: 3600,
+        // 组的 url-test / fallback 已经在测速，provider 再测一遍纯属浪费。
+        'health-check': { enable: false },
+      },
+    };
+  }
 
   if (withGroups && orchestration) {
-    if (orchestration.groups.length > 0) config['proxy-groups'] = orchestration.groups;
+    if (orchestration.groups.length > 0) {
+      config['proxy-groups'] = orchestration.groups.map((group) => {
+        const { excludeFilter, ...rest } = group;
+        const out: Record<string, unknown> = { ...rest };
+        // Clash 的键是 `exclude-filter`，不是我们内部模型里的驼峰写法。
+        if (excludeFilter) out['exclude-filter'] = excludeFilter;
+        // provider 模式的分组可能只靠 filter 取成员，此时 `proxies` 为空。
+        // 空数组会让客户端判定"组为空"并拒绝加载，必须整键省略。
+        if (group.proxies.length === 0) delete out.proxies;
+        return out;
+      });
+    }
     if (Object.keys(orchestration.providers).length > 0) {
       config['rule-providers'] = orchestration.providers;
     }
@@ -525,4 +566,26 @@ export function emitClash(nodes: readonly ProxyNode[], options: ClashEmitOptions
   };
   if (warnings.length > 0) result.warnings = warnings;
   return result;
+}
+
+/**
+ * 只输出 `proxies:` 的节点源，供 `proxy-providers[].url` 指向。
+ *
+ * 这是 P3 的另一半：配置里不再内联节点，客户端按需拉这个文件。
+ * 内容必须只有 `proxies` —— 带上 proxy-groups 或 rules 会让客户端
+ * 把节点源当成配置去解析，行为不可预期。
+ */
+export function emitClashProvider(
+  nodes: readonly ProxyNode[],
+  options: { target: 'clash' | 'clash.meta' },
+): EmitResult {
+  const { usable, skipped } = partitionBySupport(nodes, options.target);
+  const body = stringifyYaml({ proxies: usable.map(toClashProxy) }, { lineWidth: 0 });
+
+  return {
+    body,
+    contentType: 'text/yaml; charset=utf-8',
+    nodeCount: usable.length,
+    skipped,
+  };
 }

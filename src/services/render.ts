@@ -68,6 +68,20 @@ export interface RenderOptions {
    * 不给则保留下游原始 URL —— 预览走的就是这条路，因为预览拿不到 token。
    */
   ruleProxyBase?: string;
+  /**
+   * 节点源地址，形如 `https://host/sub/<token>?target=clash.provider`。
+   *
+   * 给了它就切到 provider 模式：配置里不再内联节点，分组成员由客户端
+   * `filter` 求值，机场改名免疫。
+   */
+  nodeProviderUrl?: string;
+  /**
+   * 强制内联节点（`?style=inline`）。
+   *
+   * 逃生舱：个别客户端或场景下 provider 行为异常时，用户还能拿到一份
+   * 自包含的配置，而不是只能等我们发版。
+   */
+  style?: 'provider' | 'inline';
 }
 
 export interface RenderResult {
@@ -163,6 +177,10 @@ export function renderProfile(
             // 规则集走我们自己的转换端点：客户端只拿得到目标 behavior 对应的
             // 干净格式，SR 的前导点列表、GitHub blob 地址这类坑在这里被吃掉。
             ...(options.ruleProxyBase ? { ruleProxyBase: options.ruleProxyBase } : {}),
+            // 节点源模式。`?style=inline` 是逃生舱，让用户能拿回自包含配置。
+            ...(options.nodeProviderUrl && options.style !== 'inline'
+              ? { nodeProviderUrl: options.nodeProviderUrl }
+              : {}),
           },
         }
       : {}),

@@ -21,7 +21,12 @@
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import type { AppContext } from '../../context.js';
-import { EMIT_TARGETS, TARGET_LABELS, emitUri, type EmitTarget } from '../../core/emit/index.js';
+import {
+  TARGET_LABELS,
+  UI_TARGETS,
+  emitUri,
+  type EmitTarget,
+} from '../../core/emit/index.js';
 import { applyFilter, DEFAULT_EXCLUDE_PATTERNS, type FilterRule } from '../../core/filter.js';
 import { parseShadowrocketConf } from '../../core/orchestrate-import.js';
 import { ORCHESTRATION_PRESETS, IOS_MIGRATED } from '../../core/orchestrate-presets.js';
@@ -339,7 +344,7 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
       // 这两处 satisfies 是 schema 的**反向**对齐检查：core 层新增了协议或输出目标、
       // 而上面的 zod 清单忘了跟进时，编译期就会失败。
       // 没有这道检查的话，遗漏的表现是用户在界面上按新协议筛选时莫名收到 400。
-      targets: (EMIT_TARGETS satisfies readonly z.infer<typeof TargetSchema>[]).map((t) => ({
+      targets: (UI_TARGETS satisfies readonly z.infer<typeof TargetSchema>[]).map((t) => ({
         value: t,
         label: TARGET_LABELS[t],
       })),

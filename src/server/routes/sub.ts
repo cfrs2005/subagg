@@ -31,7 +31,18 @@ import { renderProfile } from '../../services/render.js';
  * 便于用 `curl -I` 直接查看。
  */
 function toHeaderValue(value: string, maxLength = 3000): string {
-  const encoded = value.replace(/[^\x20-\x7e]/g, (ch) => encodeURIComponent(ch));
+  // 必须按"连续的非 ASCII 段"整体编码，不能逐字符。
+  //
+  // emoji 在 JS 里是代理对（`🔒` = \uD83D\uDD12），逐字符编码时会把半个
+  // 代理对交给 encodeURIComponent，它会抛 `URI malformed` —— 结果是
+  // 一条诊断告警把整个订阅打成 500。整段编码顺带还能处理任何畸形输入。
+  const encoded = value.replace(/[^\x20-\x7e]+/g, (chunk) => {
+    try {
+      return encodeURIComponent(chunk);
+    } catch {
+      return '[?]';
+    }
+  });
   // HTTP 头有总长度上限。编排校验可能一次产生几十条告警，
   // 这里截断而不是让响应头超限导致整个请求失败。
   // 截断标记必须用 ASCII —— 头部值里出现非 latin1 字符会让 Node 直接抛错，
@@ -48,6 +59,11 @@ interface SubQuery {
   target?: string;
   /** 传 `0` 得到明文 URI 列表而非 base64，便于人工核对。 */
   base64?: string;
+  /**
+   * `inline` 强制把节点内联进配置（不使用 proxy-providers）。
+   * 逃生舱：provider 在某个客户端上行为异常时，用户不必等我们发版。
+   */
+  style?: string;
 }
 
 export function createSubRoutes(ctx: AppContext): FastifyPluginAsync {
@@ -170,6 +186,9 @@ export function createSubRoutes(ctx: AppContext): FastifyPluginAsync {
           // rule-providers 指向本站的规则集转换端点：源站的格式差异
           // （SR 前导点、GitHub blob、扩展名拼错）在这里被一次性吃掉。
           ruleProxyBase: `${baseUrl}/r/${token}`,
+          // 节点走 proxy-providers：配置里不再内联节点，改名由客户端 filter 兜住。
+          nodeProviderUrl: `${baseUrl}/sub/${token}?target=clash.provider`,
+          style: req.query.style === 'inline' ? 'inline' : undefined,
           // .conf 输出需要知道自己的 URL（写进 update-url）和节点订阅 URL
           // （写进头部注释）。其他目标会忽略这两个键。
           ...(req.query.target === 'conf' || req.query.target === 'shadowrocket.conf'

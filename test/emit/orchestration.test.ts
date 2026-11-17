@@ -521,3 +521,66 @@ describe('内置预设', () => {
     expect(resolved.warnings.some((warning) => warning.includes('仅大小写不同'))).toBe(true);
   });
 });
+
+describe('节点源模式（proxy-providers）', () => {
+  it('分组成员写成 use + filter，节点名不再出现在 proxies 里', () => {
+    const resolved = resolveOrchestration(
+      nodes,
+      {
+        groups: [
+          {
+            name: 'AI',
+            type: 'url-test',
+            members: [{ kind: 'nodes', select: { nameRegex: '^GANBEI-' } }],
+          },
+          { name: 'PROXY', type: 'select', members: [{ kind: 'nodes', select: {} }] },
+        ],
+        rules: [{ type: 'MATCH', policy: 'PROXY' }],
+      },
+      { providerMode: true },
+    );
+
+    const ai = resolved.groups.find((group) => group.name === 'AI')!;
+    expect(ai.use).toEqual(['subagg']);
+    expect(ai.filter).toBe('(?i:^GANBEI-)');
+    // url-test 绝不能有 DIRECT 兜底：它会参与测速，赢了就静默直连。
+    expect(ai.proxies).toEqual([]);
+
+    // 无约束选择器 = 全部节点，此时不该有 filter（有 filter 反而可能误伤）。
+    const proxy = resolved.groups.find((group) => group.name === 'PROXY')!;
+    expect(proxy.use).toEqual(['subagg']);
+    expect(proxy.filter).toBeUndefined();
+  });
+
+  it('规则指向具体节点时自动生成单节点分组（否则客户端拒载）', () => {
+    const resolved = resolveOrchestration(
+      nodes,
+      {
+        groups: [{ name: 'PROXY', type: 'select', members: [{ kind: 'nodes', select: {} }] }],
+        rules: [
+          { type: 'DOMAIN-SUFFIX', value: 'drleao.cn', policy: 'DMIT-VIA-US-LOS-CG' },
+          { type: 'MATCH', policy: 'PROXY' },
+        ],
+      },
+      { providerMode: true },
+    );
+
+    const synthetic = resolved.groups.find((group) => group.name.startsWith('🔒'));
+    expect(synthetic?.filter).toBe('(?i:^DMIT-VIA-US-LOS-CG$)');
+    expect(synthetic?.use).toEqual(['subagg']);
+    // 规则改成指向分组：provider 节点不在全局代理池里，直接写名字会加载失败。
+    expect(resolved.rules).toContain(`DOMAIN-SUFFIX,drleao.cn,${synthetic!.name}`);
+  });
+
+  it('内联模式不受影响（.conf 与 ?style=inline 仍拿名单）', () => {
+    const resolved = resolveOrchestration(nodes, {
+      groups: [{ name: 'AI', type: 'select', members: [{ kind: 'nodes', select: { nameRegex: 'GANBEI' } }] }],
+      rules: [{ type: 'MATCH', policy: 'AI' }],
+    });
+
+    const ai = resolved.groups[0]!;
+    expect(ai.use).toBeUndefined();
+    expect(ai.filter).toBeUndefined();
+    expect(ai.proxies).toEqual(['GANBEI-VIA-TXSH']);
+  });
+});

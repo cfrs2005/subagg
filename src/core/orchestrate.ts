@@ -147,6 +147,18 @@ export interface ResolvedGroup {
   url?: string;
   interval?: number;
   tolerance?: number;
+  /**
+   * provider 模式：分组成员交给客户端的 `proxy-providers` 过滤，不再写死名单。
+   *
+   * 这是 Clash.Meta 相对 Shadowrocket 最本质的差别之一 —— 机场改名时，
+   * filter 在客户端重新求值，配置一行都不用改；而写死的名单会同时丢掉
+   * 用户手动选中的节点。
+   */
+  use?: string[];
+  /** Go regexp（RE2）语法，多个选择器取并集。 */
+  filter?: string;
+  /** 同时给 `proxies` 显式列出的节点要排掉，否则同名重复。 */
+  excludeFilter?: string;
 }
 
 export interface ResolvedProvider {
@@ -198,6 +210,14 @@ const RESERVED_POLICIES: ReadonlySet<string> = new Set([
 const MAX_GROUP_NAME = 64;
 const MAX_GROUPS = 64;
 const MAX_RULES = 1000;
+
+/** 节点源在 `proxy-providers` 里的名字。生成与引用必须用同一个，所以导出。 */
+export const PROVIDER_NAME = 'subagg';
+
+/** 把字面量转义成正则。节点名里的 `[` `(` 很常见（`[M][TROJAN]`）。 */
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 const RULE_TYPES: ReadonlySet<string> = new Set<OrchestrationRuleType>([
   'DOMAIN',
   'DOMAIN-SUFFIX',
@@ -294,13 +314,13 @@ function matchesSelector(node: ProxyNode, compiled: CompiledSelector): boolean {
  * 常常带 `[M][TROJAN]` 这类方括号，直接当正则会立刻语法错误 ——
  * 所以精确名优先，正则只是补充。
  */
-function applyPreferred(
-  names: string[],
+function resolvePreferredNames(
+  names: readonly string[],
   preferred: readonly string[] | undefined,
   owner: string,
   warnings: string[],
 ): string[] {
-  if (!Array.isArray(preferred) || preferred.length === 0 || names.length === 0) return names;
+  if (!Array.isArray(preferred) || preferred.length === 0 || names.length === 0) return [];
 
   const ordered: string[] = [];
   const taken = new Set<string>();
@@ -328,10 +348,22 @@ function applyPreferred(
     }
   }
 
+  return ordered;
+}
+
+function applyPreferred(
+  names: string[],
+  preferred: readonly string[] | undefined,
+  owner: string,
+  warnings: string[],
+): string[] {
+  const ordered = resolvePreferredNames(names, preferred, owner, warnings);
+  if (ordered.length === 0) return names;
+
+  const taken = new Set(ordered);
   for (const name of names) {
     if (!taken.has(name)) ordered.push(name);
   }
-
   return ordered;
 }
 
@@ -343,14 +375,44 @@ interface WorkingGroup extends ResolvedGroup {
   /** 原始成员顺序：节点名与组引用混在一起，后面统一做丢弃与去环。 */
   members: string[];
   onEmpty?: 'drop' | 'direct';
+  /** provider 模式下该组当前节点集里的命中数，用于"别发出空组"的预检。 */
+  matchedCount?: number;
+}
+
+interface ResolvedMembers {
+  members: string[];
+  /** provider 模式下可用的选择器正则（原始写法，尚未包装成 RE2 并集）。 */
+  includes: string[];
+  excludes: string[];
+  /** 有"无约束"选择器（= 全部节点），filter 应当省略。 */
+  usesAll: boolean;
+  /** 含按来源 / 地区 / 协议 / 指纹的选择器时，无法用 filter 表达。 */
+  providerable: boolean;
+}
+
+/**
+ * 判断一条正则能否安全地交给 mihomo。
+ *
+ * JS 比 RE2 宽松：前后向断言和反向引用在 JS 里合法，在 Go 的 RE2 里是语法
+ * 错误。一旦写进 `filter`，客户端加载整份配置就会失败 —— 这是"一个正则
+ * 搞挂整个订阅"的典型路径，所以宁可退化回内联名单。
+ */
+function re2Compatible(pattern: string): boolean {
+  return !/\(\?[=!<]|\\[1-9]/.test(pattern);
 }
 
 function resolveGroupMembers(
   group: OrchestrationGroup,
   nodes: readonly ProxyNode[],
   warnings: string[],
-): string[] {
+  providerMode: boolean,
+): ResolvedMembers {
   const members: string[] = [];
+  const includes: string[] = [];
+  const excludes: string[] = [];
+  let usesAll = false;
+  let providerable = true;
+
   const rawMembers = Array.isArray(group.members) ? group.members : [];
 
   for (const member of rawMembers) {
@@ -370,18 +432,50 @@ function resolveGroupMembers(
 
     if (member.kind !== 'nodes') continue;
 
-    const compiled = compileSelector(member.select ?? {}, group.name, warnings);
+    const selector = member.select ?? {};
+    const compiled = compileSelector(selector, group.name, warnings);
     const selected = nodes.filter((node) => matchesSelector(node, compiled)).map((node) => node.name);
     members.push(...selected);
+
+    if (!providerMode) continue;
+
+    // 只有"按名字筛"的选择器能翻译成 filter；其余条件在客户端侧无法表达。
+    const nameOnly =
+      !selector.pick?.length &&
+      !selector.source?.length &&
+      !selector.region?.length &&
+      !selector.type?.length;
+    if (!nameOnly) {
+      providerable = false;
+      continue;
+    }
+
+    if (selector.nameRegex && compiled.include) {
+      if (re2Compatible(selector.nameRegex)) includes.push(selector.nameRegex);
+      else {
+        providerable = false;
+        warnings.push(
+          `分组「${group.name}」的正则含 RE2 不支持的语法，已改为内联节点名单（否则客户端会加载失败）`,
+        );
+      }
+    } else if (!selector.nameRegex) {
+      // 没有任何名字约束 = 全部节点。
+      usesAll = true;
+    }
+
+    if (selector.excludeNameRegex && re2Compatible(selector.excludeNameRegex)) {
+      excludes.push(selector.excludeNameRegex);
+    }
   }
 
-  return members;
+  return { members, includes, excludes, usesAll, providerable };
 }
 
 function buildWorkingGroups(
   spec: Orchestration,
   nodes: readonly ProxyNode[],
   warnings: string[],
+  providerMode: boolean,
 ): WorkingGroup[] {
   const groups: WorkingGroup[] = [];
   const seen = new Set<string>();
@@ -427,12 +521,14 @@ function buildWorkingGroups(
       continue;
     }
 
-    const members = applyPreferred(
-      resolveGroupMembers(group, nodes, warnings),
+    const collected = resolveGroupMembers(group, nodes, warnings, providerMode);
+    const preferredNames = resolvePreferredNames(
+      collected.members,
       group.preferred,
       name,
       warnings,
     );
+    const members = applyPreferred(collected.members, group.preferred, name, warnings);
 
     const resolved: WorkingGroup = {
       name,
@@ -443,6 +539,54 @@ function buildWorkingGroups(
       interval: clampInt(group.interval, 60, 86_400, 300),
       tolerance: clampInt(group.tolerance, 0, 10_000, 50),
     };
+
+    if (providerMode && collected.providerable) {
+      const hasNodeSelector = collected.usesAll || collected.includes.length > 0;
+
+      if (hasNodeSelector) {
+        // provider 模式里 `proxies` **只能**放组引用和内置策略：
+        // 实测 mihomo 会报 `'NAME' not found` —— provider 提供的节点不在全局
+        // 代理池里，只有组的 `use` + `filter` 能取到它们。
+        resolved.proxies = members.filter((member) => !nodeNames.has(member));
+        resolved.use = [PROVIDER_NAME];
+        resolved.matchedCount = members.filter((member) => nodeNames.has(member)).length;
+
+        if (!collected.usesAll) {
+          const union = collected.includes.map((pattern) => `(?i:${pattern})`).join('|');
+          if (union) resolved.filter = union;
+        }
+
+        if (collected.excludes.length > 0) {
+          resolved.excludeFilter = collected.excludes.map((pattern) => `(?i:${pattern})`).join('|');
+        }
+
+        // 这里**故意不加** `DIRECT` 兜底。
+        //
+        // `proxies` 里的成员排在 provider 节点之前：fallback 会先试它，
+        // select 会默认选中它。加一个 DIRECT 就等于"机场改名后流量静默走直连"——
+        // 那是比报错严重得多的错误，尤其对 AI 分组。
+        // 宁可让组变空（用户在客户端一眼能看到"这个组没节点"），也不要静默降级。
+
+        // `preferred` 是"钉死某个节点名"的语义，与"改名免疫"天然互斥：
+        // 写进 proxies 会因为该名字来自 provider 而被拒，写进 filter 又表达
+        // 不了顺序。这里明确丢弃并告警，而不是留一个会随时炸的悬空引用。
+        if (preferredNames.length > 0) {
+          warnings.push(
+            `分组「${name}」的首选节点在节点源模式下不生效（顺序由节点源决定）；` +
+              '需要钉死具体节点请在该订阅链接后加 ?style=inline',
+          );
+        }
+
+        // 当前节点集里一条都命中不了，说明过滤器与这个配置文件不匹配 ——
+        // 交给客户端就是加载失败。退回内联名单，至少能跑。
+        if (resolved.matchedCount === 0 && resolved.proxies.length === 0 && !collected.usesAll) {
+          resolved.use = undefined;
+          resolved.filter = undefined;
+          resolved.excludeFilter = undefined;
+        }
+      }
+    }
+
     if (group.onEmpty === 'direct') {
       resolved.onEmpty = 'direct';
       if (members.length === 0) resolved.members = ['DIRECT'];
@@ -475,18 +619,29 @@ function pruneGroups(
   while (changed) {
     changed = false;
     for (const group of [...alive.values()]) {
-      // 成员有两种：真实节点名与分组引用。节点名永远有效（它们来自本次
-      // 渲染的节点列表），分组引用只有在被引用的分组仍然存活时才保留。
-      const proxies = [
-        ...new Set(
-          group.members.filter(
-            (member) => member === 'DIRECT' || nodeNames.has(member) || alive.has(member),
+      // provider 模式的分组：`proxies` 只放组引用 / 策略 / 首选节点，
+      // 是从 members 里挑出来的，不能按 members 重建。
+      if (group.use) {
+        group.proxies = group.proxies.filter(
+          (member) => member === 'DIRECT' || member === 'REJECT' || nodeNames.has(member) || alive.has(member),
+        );
+      } else {
+        // 成员有两种：真实节点名与分组引用。节点名永远有效（它们来自本次
+        // 渲染的节点列表），分组引用只有在被引用的分组仍然存活时才保留。
+        group.proxies = [
+          ...new Set(
+            group.members.filter(
+              (member) => member === 'DIRECT' || nodeNames.has(member) || alive.has(member),
+            ),
           ),
-        ),
-      ];
-      group.proxies = proxies;
+        ];
+      }
 
-      if (proxies.length > 0) continue;
+      if (group.proxies.length > 0) continue;
+
+      // 客户端会用自己的 filter 把 provider 节点填进来，这里不算空 ——
+      // 但前提是当前节点集里确实有命中，否则客户端反而会加载失败。
+      if (group.use && (group.matchedCount ?? 0) > 0) continue;
 
       // 显式声明了 onEmpty=direct 的分组退化成直连，而不是消失。
       // 这在"A 引用 B、B 也空了"的链式丢弃里同样要生效，所以放在循环内。
@@ -835,6 +990,82 @@ function buildDns(
 // ─────────────────────────────────────────────────────────────
 
 /**
+ * 节点源模式下，把「规则指向具体节点」改写成「规则指向一个只含该节点的组」。
+ *
+ * 为什么必须改：provider 提供的节点**不在全局代理池里**，规则里直接写节点名
+ * 会让 mihomo 报 `proxy [X] not found` 并拒绝加载整份配置（实测确认）。
+ * 而用户 conf 里恰恰有这种规则（`drleao.cn → DMIT-VIA-US-LOS-CG`）。
+ *
+ * 合成组用 `use` + 精确 filter 表达同一个意思，顺带获得改名免疫：
+ * 节点改名后 filter 落空，`onEmpty: direct` 让它退化为直连而不是让配置崩掉。
+ */
+function expandNodePolicies(
+  spec: Orchestration,
+  nodeNames: ReadonlySet<string>,
+  lowerToName: ReadonlyMap<string, string>,
+  warnings: string[],
+): Orchestration {
+  const declared = new Set(
+    (Array.isArray(spec.groups) ? spec.groups : [])
+      .map((group) => (typeof group?.name === 'string' ? group.name.trim() : ''))
+      .filter(Boolean),
+  );
+
+  const extraGroups: OrchestrationGroup[] = [];
+  const byNode = new Map<string, string>();
+  const rules: OrchestrationRule[] = [];
+  let rewritten = 0;
+
+  for (const rule of Array.isArray(spec.rules) ? spec.rules : []) {
+    const policy = typeof rule?.policy === 'string' ? rule.policy.trim() : '';
+    if (!policy || policy === 'DIRECT' || policy === 'REJECT' || declared.has(policy)) {
+      rules.push(rule);
+      continue;
+    }
+
+    const nodeName = nodeNames.has(policy) ? policy : lowerToName.get(policy.toLowerCase());
+    if (!nodeName) {
+      rules.push(rule);
+      continue;
+    }
+
+    let groupName = byNode.get(nodeName);
+    if (!groupName) {
+      groupName = `🔒 ${nodeName}`.slice(0, MAX_GROUP_NAME);
+      extraGroups.push({
+        name: groupName,
+        type: 'select',
+        members: [{ kind: 'nodes', select: { nameRegex: `^${escapeRegex(nodeName)}$` } }],
+        onEmpty: 'direct',
+      });
+      byNode.set(nodeName, groupName);
+    }
+
+    rules.push({ ...rule, policy: groupName });
+    rewritten += 1;
+  }
+
+  if (extraGroups.length === 0) return spec;
+
+  warnings.push(
+    `${rewritten} 条规则原本指向具体节点，已改为指向自动生成的「🔒 节点名」分组` +
+      '（节点源模式不允许规则直接引用 provider 节点）',
+  );
+
+  return { ...spec, groups: [...(spec.groups ?? []), ...extraGroups], rules };
+}
+
+export interface ResolveOptions {
+  /**
+   * 分组成员交给客户端的 `proxy-providers` + `filter` 求值，而不是写死名单。
+   *
+   * 只有 `clash.meta` 能这么干；`.conf`（Shadowrocket）没有 provider 概念，
+   * 必须用内联名单。所以这是 emiter 的选择，不是编排本身的属性。
+   */
+  providerMode?: boolean;
+}
+
+/**
  * 把声明式编排解析成可以直接写进 YAML 的分组与规则。
  *
  * @param nodes 已经过过滤、重命名、能力筛选的节点。**必须**是最终要输出的那批，
@@ -843,15 +1074,27 @@ function buildDns(
 export function resolveOrchestration(
   nodes: readonly ProxyNode[],
   spec: Orchestration,
+  options: ResolveOptions = {},
 ): ResolvedOrchestration {
+  const providerMode = options.providerMode === true;
   const warnings: string[] = [];
 
   const nodeNames = new Set(nodes.map((node) => node.name));
+  // 规则策略里写的是"用户 conf 里的节点名拼写"，与订阅实际节点名可能只有
+  // 大小写差异（DMIT-VIA-US-LOS-CG vs DMIT-via-US-LOS-CG）。Clash 的规则
+  // 匹配是大小写敏感的，所以这里做一次不敏感查找、**回写成真实节点名**。
+  const nodeNameByLower = new Map(nodes.map((node) => [node.name.toLowerCase(), node.name]));
+
+  // provider 模式：规则不能直接引用节点名（不在全局代理池里，客户端会拒载），
+  // 先把这类规则改写成指向自动生成的单节点分组。
+  const effective = providerMode
+    ? expandNodePolicies(spec, nodeNames, nodeNameByLower, warnings)
+    : spec;
 
   // 顺序很重要：先丢空组，再断环（断环可能又造出空组），最后再丢一次。
   const working = pruneGroups(
     breakCycles(
-      pruneGroups(buildWorkingGroups(spec, nodes, warnings), nodeNames, warnings),
+      pruneGroups(buildWorkingGroups(effective, nodes, warnings, providerMode), nodeNames, warnings),
       warnings,
     ),
     nodeNames,
@@ -861,17 +1104,11 @@ export function resolveOrchestration(
   const groupNames = new Set(working.map((group) => group.name));
   const providersReferenced = new Set<string>();
 
-  // 规则策略里写的是"用户 conf 里的节点名拼写"，与订阅实际节点名可能只有
-  // 大小写差异（DMIT-VIA-US-LOS-CG vs DMIT-via-US-LOS-CG）。Clash 的规则
-  // 匹配是大小写敏感的，所以这里做一次不敏感查找、**回写成真实节点名** ——
-  // 直接丢弃会让 drleao.cn 这类指向具体节点的规则悄无声息地失效。
-  const nodeNameByLower = new Map(nodes.map((node) => [node.name.toLowerCase(), node.name]));
-
   const rules: string[] = [];
   const seenRules = new Set<string>();
   let matchRule: WorkingRule | undefined;
 
-  const declaredRules = Array.isArray(spec.rules) ? spec.rules : [];
+  const declaredRules = Array.isArray(effective.rules) ? effective.rules : [];
   if (declaredRules.length > MAX_RULES) {
     warnings.push(`规则数量超过上限 ${MAX_RULES}，多出的 ${declaredRules.length - MAX_RULES} 条已忽略`);
   }
@@ -890,7 +1127,7 @@ export function resolveOrchestration(
     }
 
     if (rule.type === 'RULE-SET') {
-      if (!spec.providers?.[rule.value]) {
+      if (!effective.providers?.[rule.value]) {
         warnings.push(`规则引用了未声明的 rule-provider「${rule.value}」，已跳过`);
         continue;
       }
@@ -928,7 +1165,7 @@ export function resolveOrchestration(
     rules.push(line);
   }
 
-  const providers = buildProviders(providersReferenced, spec.providers, warnings);
+  const providers = buildProviders(providersReferenced, effective.providers, warnings);
 
   // provider 没能输出时，引用它的规则也必须一起丢 —— 否则客户端会去加载一个
   // 不存在的 provider，同样导致整份配置失败。
@@ -959,6 +1196,9 @@ export function resolveOrchestration(
         type: group.type,
         proxies: group.proxies,
       };
+      if (group.use) resolved.use = group.use;
+      if (group.filter) resolved.filter = group.filter;
+      if (group.excludeFilter) resolved.excludeFilter = group.excludeFilter;
       if (group.type !== 'select') {
         resolved.url = group.url;
         resolved.interval = group.interval;
