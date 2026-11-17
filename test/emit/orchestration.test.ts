@@ -2,7 +2,7 @@ import { parse as parseYaml } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { emitClash } from '../../src/core/emit/clash.js';
 import { resolveOrchestration, type Orchestration } from '../../src/core/orchestrate.js';
-import { findOrchestrationPreset } from '../../src/core/orchestrate-presets.js';
+import { IOS_MIGRATED, findOrchestrationPreset } from '../../src/core/orchestrate-presets.js';
 import type { ProxyNode } from '../../src/core/types.js';
 import { makeNode } from '../helpers.js';
 
@@ -325,11 +325,75 @@ describe('内置预设', () => {
       'DIRECT',
       'REJECT',
       ...names,
+      ...nodes.map((node) => node.name),
     ]);
     for (const line of resolved.rules) {
       const parts = line.split(',');
       const policy = parts[0] === 'MATCH' ? parts[1] : parts[2];
       expect(policies.has(policy ?? '')).toBe(true);
     }
+  });
+
+  it('ios-migrated 是 conf 的忠实翻译：生产节点名（大小写不同、含同名前缀干扰项）下分组精确命中', () => {
+    // 生产库里的真实拼写：混合大小写，且存在大量 DMIT-* / verizon-* 干扰节点。
+    const prodLike: ProxyNode[] = [
+      'DMIT-via-US-LOS-CG',
+      'DMIT-ss2022',
+      'DMIT-666-R-NTT',
+      'DMIT-via-ATT-WireGuard',
+      'DMIT-Vision',
+      'IX_DMIT-666-R-NTT',
+      'verizon-via-bwg',
+      'verizon-via-txsh',
+      'verizon-via-dmit',
+      'GANBEI-via-TXSH',
+      'GANBEI-via-DMIT',
+      'IX_GANBEI-via-DMIT',
+      '沪港专线转香港BGP[M][Trojan][倍率:1.7]',
+    ].map((name) =>
+      makeNode({
+        type: 'ss',
+        name,
+        server: `${name}.example.com`,
+        port: 443,
+        cipher: 'aes-128-gcm',
+        password: 'pw',
+      }),
+    );
+
+    const resolved = resolveOrchestration(prodLike, IOS_MIGRATED);
+
+    // GOOGLE 只含 conf 里点名的两台 —— 不是所有 DMIT-*。
+    const google = resolved.groups.find((group) => group.name === 'GOOGLE');
+    expect(google?.proxies).toEqual(['DMIT-via-US-LOS-CG', 'DMIT-ss2022']);
+
+    // AI-CLAUDE：首选在前 + 内层 url-test 精确三台。
+    const claude = resolved.groups.find((group) => group.name === 'AI-CLAUDE');
+    expect(claude?.proxies).toEqual(['verizon-via-bwg', 'AI-CLAUDE-AUTO']);
+    const claudeAuto = resolved.groups.find((group) => group.name === 'AI-CLAUDE-AUTO');
+    expect(claudeAuto?.proxies).toEqual(['verizon-via-bwg', 'verizon-via-txsh', 'verizon-via-dmit']);
+
+    // AI-OPENAI：精确两台，不含 IX_ 派生。
+    const openaiAuto = resolved.groups.find((group) => group.name === 'AI-OPENAI-AUTO');
+    expect(openaiAuto?.proxies).toEqual(['GANBEI-via-TXSH', 'GANBEI-via-DMIT']);
+
+    // 指向具体节点的规则：大小写不同也要命中，并回写成真实节点名。
+    expect(resolved.rules).toContain('DOMAIN-SUFFIX,drleao.cn,DMIT-via-US-LOS-CG');
+
+    // 用户 conf 里没有的东西不能凭空出现。
+    expect(JSON.stringify(resolved.groups)).not.toContain('PROXY,url=');
+  });
+
+  it('规则策略大小写不敏感归一：命中后回写真实节点名', () => {
+    const resolved = resolveOrchestration(nodes, {
+      groups: [{ name: 'PROXY', type: 'select', members: [{ kind: 'nodes', select: {} }] }],
+      rules: [
+        { type: 'DOMAIN-SUFFIX', value: 'example.com', policy: 'dmit-via-us-los-cg' },
+        { type: 'MATCH', policy: 'PROXY' },
+      ],
+    });
+
+    expect(resolved.rules).toContain('DOMAIN-SUFFIX,example.com,DMIT-VIA-US-LOS-CG');
+    expect(resolved.warnings.some((warning) => warning.includes('仅大小写不同'))).toBe(true);
   });
 });

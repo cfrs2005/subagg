@@ -756,6 +756,12 @@ export function resolveOrchestration(
   const groupNames = new Set(working.map((group) => group.name));
   const providersReferenced = new Set<string>();
 
+  // 规则策略里写的是"用户 conf 里的节点名拼写"，与订阅实际节点名可能只有
+  // 大小写差异（DMIT-VIA-US-LOS-CG vs DMIT-via-US-LOS-CG）。Clash 的规则
+  // 匹配是大小写敏感的，所以这里做一次不敏感查找、**回写成真实节点名** ——
+  // 直接丢弃会让 drleao.cn 这类指向具体节点的规则悄无声息地失效。
+  const nodeNameByLower = new Map(nodes.map((node) => [node.name.toLowerCase(), node.name]));
+
   const rules: string[] = [];
   const seenRules = new Set<string>();
   let matchRule: WorkingRule | undefined;
@@ -766,7 +772,7 @@ export function resolveOrchestration(
   }
 
   for (const raw of declaredRules.slice(0, MAX_RULES)) {
-    const rule = normalizeRule(raw, warnings);
+    let rule = normalizeRule(raw, warnings);
     if (!rule) continue;
 
     if (rule.type === 'MATCH') {
@@ -787,8 +793,19 @@ export function resolveOrchestration(
 
     const isBuiltin = rule.policy === 'DIRECT' || rule.policy === 'REJECT';
     if (!isBuiltin && !groupNames.has(rule.policy)) {
-      if (nodeNames.has(rule.policy)) {
-        warnings.push(`规则指向具体节点「${rule.policy}」，该节点改名后规则会失效`);
+      const exactNode = nodeNames.has(rule.policy);
+      const actualNode = exactNode
+        ? rule.policy
+        : nodeNameByLower.get(rule.policy.toLowerCase());
+      if (actualNode) {
+        // 大小写不敏感命中：回写成真实节点名，保证客户端加载后真的能解析。
+        if (!exactNode) {
+          warnings.push(
+            `规则策略「${rule.policy}」与节点「${actualNode}」仅大小写不同，已按真实节点名输出`,
+          );
+        }
+        warnings.push(`规则指向具体节点「${actualNode}」，该节点改名后规则会失效`);
+        rule = { ...rule, policy: actualNode };
       } else {
         warnings.push(`规则 ${formatRule(rule)} 指向不存在的策略「${rule.policy}」，已跳过`);
         continue;
