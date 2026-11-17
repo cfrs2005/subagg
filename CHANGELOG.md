@@ -67,6 +67,14 @@
 - 新增环境变量 `IX_SYNC_INTERVAL_MINUTES`（默认 5，0 禁用后台同步），替换小时口径。
 - 数据库迁移 version 6 `ix_remote_port_refs` 为共享远端端口引用查询增加索引。
 
+### Changed
+- Simplified the generated Clash structure: the top-level `PROXY` group now lists
+  **server groups** (`♻️ 自动选择`, `GOOGLE`, `AI-CLAUDE`, `AI-OPENAI`, `DIRECT`)
+  instead of every node. Nodes sharing one exit stay inside their group and
+  auto-select by latency/stability (`url-test`/`fallback`); the `select + -AUTO`
+  wrapper introduced earlier was removed. Mirrors Shadowrocket's built-in `PROXY`
+  semantics and keeps `.conf` output in native `url-test`/`fallback` form.
+
 ### Fixed
 - Fallback / url-test groups from a Shadowrocket config are now translated into
   an outer `select` (manually switchable, preferred node first) plus an inner
