@@ -361,4 +361,21 @@ CREATE INDEX idx_oauth_attempt_expiry ON oauth_login_attempts(expires_at);
 ALTER TABLE profiles ADD COLUMN orchestration TEXT;
 `,
   },
+  {
+    version: 9,
+    name: 'settings_kv',
+    sql: `
+-- 站点级设置，key-value 形式。当前只有一个键：
+--   default_orchestration —— 全局默认 Clash 分流编排（JSON）。
+--
+-- 优先级：profile 自己的编排 > 这里的全局默认 > 代码内置模板。
+-- 全局默认让"个人长期策略"不必逐 profile 套用；删掉该键即回到
+-- 随代码发布的内置预设。
+CREATE TABLE settings (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+`,
+  },
 ];

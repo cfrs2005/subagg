@@ -61,6 +61,14 @@ const PRIVATE_RULES: Orchestration['rules'] = [
   { type: 'IP-CIDR', value: '100.64.0.0/10', policy: 'DIRECT', noResolve: true },
 ];
 
+/**
+ * 站点所有者的长期策略（由其 Shadowrocket 配置迁移而来）。
+ *
+ * 它同时扮演两个角色：
+ * 1. 「iOS 迁移」预设，可在配置编辑页一键套用；
+ * 2. **全局默认编排的兜底值** —— settings 表没写默认时用它，
+ *    于是"我的策略"天然就是所有未单独编排的 profile 的分流策略。
+ */
 const IOS_MIGRATED: Orchestration = {
   groups: [
     {
@@ -235,6 +243,8 @@ const IOS_MIGRATED: Orchestration = {
   },
   ipv6: false,
 };
+
+export { IOS_MIGRATED };
 
 export const ORCHESTRATION_PRESETS: readonly OrchestrationPreset[] = [
   {

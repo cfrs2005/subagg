@@ -211,7 +211,7 @@ describe('配置文件编排端到端', () => {
     expect(decoded).not.toContain('MATCH');
   });
 
-  it('PATCH orchestration=null 回到内置模板', async () => {
+  it('PATCH orchestration=null 后跟随全局默认（无自定义时 = iOS 迁移预设）', async () => {
     const { app } = await setup();
     const profileId = await createProfile(app);
     const token = await createToken(app, profileId);
@@ -232,8 +232,119 @@ describe('配置文件编排端到端', () => {
     });
     const config = parseYaml(clash.body) as Record<string, unknown>;
     const groups = JSON.stringify(config['proxy-groups']);
-    expect(groups).toContain('节点选择');
-    expect(groups).not.toContain('AI-OPENAI');
+    // 没有自定义全局默认时，站点所有者的长期策略（iOS 迁移预设）就是默认分流。
+    expect(groups).toContain('GOOGLE');
+    expect(groups).toContain('AI-OPENAI');
+    expect(groups).not.toContain('节点选择');
+  });
+
+  it('全局默认编排：设置后对所有未单独编排的 profile 生效，且 profile 优先', async () => {
+    const { app } = await setup();
+    const profileId = await createProfile(app);
+    const token = await createToken(app, profileId);
+
+    // 1. 写入一个极简全局默认。
+    const saved = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/default-orchestration',
+      headers: AUTH,
+      payload: {
+        orchestration: {
+          groups: [
+            {
+              name: 'GLOBAL-DEFAULT',
+              type: 'select',
+              members: [{ kind: 'nodes', select: { nameRegex: 'GANBEI' } }],
+            },
+          ],
+          rules: [{ type: 'MATCH', policy: 'GLOBAL-DEFAULT' }],
+        },
+      },
+    });
+    expect(saved.statusCode).toBe(200);
+    expect((saved.json() as { source: string }).source).toBe('custom');
+
+    // 2. profile 没有自己的编排 → 用全局默认。
+    const cleared = await app.inject({
+      method: 'PATCH',
+      url: `/api/profiles/${profileId}`,
+      headers: AUTH,
+      payload: { orchestration: null },
+    });
+    expect(cleared.statusCode).toBe(200);
+
+    const clash = await app.inject({
+      method: 'GET',
+      url: `/sub/${token}`,
+      headers: { 'user-agent': 'clash-verge/v2.2.0' },
+    });
+    const config = parseYaml(clash.body) as Record<string, unknown>;
+    expect(config['rules']).toEqual(['MATCH,GLOBAL-DEFAULT']);
+    expect(JSON.stringify(config['proxy-groups'])).toContain('GLOBAL-DEFAULT');
+
+    // 3. profile 自己的编排仍然优先于全局默认。
+    const overridden = await app.inject({
+      method: 'PATCH',
+      url: `/api/profiles/${profileId}`,
+      headers: AUTH,
+      payload: { orchestration: ORCHESTRATION },
+    });
+    expect(overridden.statusCode).toBe(200);
+
+    const clashAgain = await app.inject({
+      method: 'GET',
+      url: `/sub/${token}`,
+      headers: { 'user-agent': 'clash-verge/v2.2.0' },
+    });
+    const configAgain = parseYaml(clashAgain.body) as Record<string, unknown>;
+    expect(configAgain['rules']).toContain('MATCH,PROXY');
+    expect(JSON.stringify(configAgain['proxy-groups'])).not.toContain('GLOBAL-DEFAULT');
+
+    // 4. 清除全局默认 = 回到内置预设。
+    const reset = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/default-orchestration',
+      headers: AUTH,
+      payload: { orchestration: null },
+    });
+    expect((reset.json() as { source: string }).source).toBe('preset');
+  });
+
+  it('?target=shadowrocket.conf 输出完整远程配置，节点订阅不受影响', async () => {
+    const { app } = await setup();
+    const profileId = await createProfile(app);
+    const token = await createToken(app, profileId);
+
+    const conf = await app.inject({
+      method: 'GET',
+      url: `/sub/${token}?target=shadowrocket.conf`,
+    });
+    expect(conf.statusCode).toBe(200);
+    expect(String(conf.headers['content-type'])).toMatch(/^text\/plain/);
+
+    // 分组引用真实节点名；FINAL 由 MATCH 翻译而来；update-url 指回本配置。
+    expect(conf.body).toContain('[Proxy Group]');
+    expect(conf.body).toContain('AI-OPENAI = select');
+    expect(conf.body).toContain('GANBEI-VIA-TXSH');
+    expect(conf.body).toContain('DOMAIN-SUFFIX,gs-robot.com,DIRECT');
+    // FINAL 是 [Rule] 段的最后一条；其后只允许跟 [Host] 段。
+    expect(conf.body).toContain('FINAL,PROXY');
+    expect(conf.body.indexOf('GEOIP')).toBe(-1);
+    expect(conf.body).toContain(
+      `update-url = http://127.0.0.1:8787/sub/${token}?target=shadowrocket.conf`,
+    );
+    // RULE-SET 必须回填规则集原始 URL，而不是 Clash 的 provider key。
+    expect(conf.body).toContain('RULE-SET,https://');
+
+    // 同一条 token 的节点订阅行为不变。
+    const sr = await app.inject({
+      method: 'GET',
+      url: `/sub/${token}`,
+      headers: { 'user-agent': 'Shadowrocket/2.2.20 (iPhone; iOS 18.0)' },
+    });
+    expect(sr.statusCode).toBe(200);
+    const decoded = Buffer.from(sr.body, 'base64').toString('utf8');
+    expect(decoded).toContain('DMIT-VIA-US-LOS-CG');
   });
 
   it('导入接口把 Shadowrocket 配置解析成编排', async () => {

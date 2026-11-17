@@ -28,12 +28,13 @@ import type { ProxyNode, ProxyType } from '../types.js';
  * `clash` 与 `clash.meta` 分开，是因为两者的协议支持差异巨大 ——
  * 这是整个矩阵里最有价值的一条区分。
  */
-export type EmitTarget = 'clash' | 'clash.meta' | 'shadowrocket' | 'v2ray';
+export type EmitTarget = 'clash' | 'clash.meta' | 'shadowrocket' | 'shadowrocket.conf' | 'v2ray';
 
 export const EMIT_TARGETS: readonly EmitTarget[] = [
   'clash',
   'clash.meta',
   'shadowrocket',
+  'shadowrocket.conf',
   'v2ray',
 ] as const;
 
@@ -46,6 +47,7 @@ export const TARGET_LABELS: Readonly<Record<EmitTarget, string>> = {
   clash: 'Clash（原版内核）',
   'clash.meta': 'Clash.Meta / mihomo',
   shadowrocket: 'Shadowrocket',
+  'shadowrocket.conf': 'Shadowrocket 配置文件（.conf）',
   v2ray: 'V2Ray / v2rayN',
 };
 
@@ -74,6 +76,17 @@ const SUPPORTED_TYPES: Readonly<Record<EmitTarget, ReadonlySet<ProxyType>>> = {
   // 新版本已支持 hysteria2 / tuic；ssr 在部分客户端上缺失，
   // 但 URI 本身是合法的，客户端至多忽略该行而不会整体失败，故予以放行。
   v2ray: new Set<ProxyType>(['ss', 'ssr', 'vmess', 'vless', 'trojan', 'hysteria2', 'tuic']),
+  // Shadowrocket 完整配置文件（.conf）。协议面与订阅一致；
+  // 节点本身不写进 conf（仍由订阅提供），这里只决定分组能否引用它。
+  'shadowrocket.conf': new Set<ProxyType>([
+    'ss',
+    'ssr',
+    'vmess',
+    'vless',
+    'trojan',
+    'hysteria2',
+    'tuic',
+  ]),
 };
 
 export type ChainMechanism = 'none' | 'shadowrocket-chain' | 'dialer-proxy';
@@ -81,12 +94,14 @@ const CHAIN_MECHANISM: Readonly<Record<EmitTarget, ChainMechanism>> = {
   clash: 'none',
   'clash.meta': 'dialer-proxy',
   shadowrocket: 'shadowrocket-chain',
+  'shadowrocket.conf': 'shadowrocket-chain',
   v2ray: 'none',
 };
 const CHAINABLE_TYPES: Readonly<Record<EmitTarget, ReadonlySet<ProxyType>>> = {
   clash: new Set(),
   'clash.meta': new Set(['ss', 'ssr', 'vmess', 'vless', 'trojan']),
   shadowrocket: new Set(['ss', 'vmess', 'vless', 'trojan']),
+  'shadowrocket.conf': new Set(['ss', 'vmess', 'vless', 'trojan']),
   v2ray: new Set(),
 };
 

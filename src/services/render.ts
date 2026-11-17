@@ -19,6 +19,7 @@ import { emit, resolveTarget, type EmitTarget, type SkippedNode } from '../core/
 import { applyFilter, type FilterStats } from '../core/filter.js';
 import { expandChain, type ChainStats } from '../core/chain.js';
 import type { Orchestration } from '../core/orchestrate.js';
+import { IOS_MIGRATED } from '../core/orchestrate-presets.js';
 import type { ProxyNode, TrafficInfo } from '../core/types.js';
 import { aggregateUserinfo, formatUserinfo } from '../core/userinfo.js';
 import type { Profile } from '../db/repo/profiles.js';
@@ -31,6 +32,13 @@ export interface RenderDeps {
     warningsForPick?(fingerprints: readonly string[] | undefined): string[];
   };
   traffic: TrafficRepo;
+  /**
+   * 站点级设置。全局默认编排从这里读：
+   * profile 没写编排时用它，再没有才落到代码内置模板。
+   */
+  settings?: {
+    getDefaultOrchestration(): Orchestration | null;
+  };
 }
 
 export interface RenderOptions {
@@ -49,6 +57,10 @@ export interface RenderOptions {
    * （回退内置模板）；对象 = 用这份临时编排。
    */
   orchestration?: Orchestration | null;
+  /** 本订阅的节点列表 URL。写进 .conf 头部注释，方便对照添加订阅。 */
+  subUrl?: string;
+  /** .conf 输出自己的 URL，写进 [General] update-url 供 App 检查更新。 */
+  confUrl?: string;
 }
 
 export interface RenderResult {
@@ -105,12 +117,32 @@ export function renderProfile(
   const chained = expandChain(filtered.nodes, rule.chain, all);
 
   // ── 3. 生成 ─────────────────────────────────────────
+  //
+  // 编排的生效顺序（对 Clash 与 .conf 两个目标一致）：
+  //   本次请求的临时编排（预览用）
+  //   > profile 自己的编排
+  //   > 全局默认（settings 表，可在系统设置页改）
+  //   > 代码里的 IOS_MIGRATED 预设 —— 站点所有者的长期策略，天然就是这里的默认值。
+  // 改一次全局默认，所有没写专属编排的 profile 一起生效。
   const orchestration =
-    options.orchestration === undefined ? profile.orchestration : options.orchestration;
+    options.orchestration === undefined
+      ? (profile.orchestration ??
+        deps.settings?.getDefaultOrchestration() ??
+        IOS_MIGRATED)
+      : options.orchestration;
   const emitOptions = {
     ...(options.base64 === undefined ? {} : { base64: options.base64 }),
-    // Clash 之外的 emitter 会忽略它；传 undefined 也不会改变默认模板。
+    // 不相关目标的 emitter 会忽略这些键；传 undefined 也不会改变默认模板。
     ...(orchestration ? { clash: { orchestration } } : {}),
+    ...(resolved.target === 'shadowrocket.conf'
+      ? {
+          shadowrocketConf: {
+            ...(orchestration ? { orchestration } : {}),
+            ...(options.confUrl ? { confUrl: options.confUrl } : {}),
+            ...(options.subUrl ? { subUrl: options.subUrl } : {}),
+          },
+        }
+      : {}),
   };
   const emitted = emit(chained.nodes, resolved.target, emitOptions);
 

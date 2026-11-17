@@ -6,6 +6,18 @@
 ## [Unreleased]
 
 ### Added
+- Shadowrocket can now receive the **full routing policy** from the site: the same
+  profile/token also serves `?target=shadowrocket.conf`, a complete remote config
+  (groups with real node names, rules with `FINAL` and raw `RULE-SET` URLs,
+  reverse-mapped DNS policy and static hosts, `update-url` pointing back at
+  itself). Nodes still come from the plain subscription, so credentials live in
+  one place only.
+- `X-Subagg-Warning-Count` response header; `X-Subagg-Warning` is truncated to a
+  safe length so a profile with dozens of warnings cannot blow the header limit.
+- Site-wide default orchestration (migration v9 adds a `settings` kv table):
+  effective order is profile's own orchestration > global default (editable in
+  System Settings, `.conf` import supported) > the built-in `ios-migrated` preset
+  derived from the owner's long-running Shadowrocket policy.
 - Per-profile Clash.Meta orchestration: declarative proxy groups
   (`select` / `url-test` / `fallback` / `load-balance`) resolved from node
   selectors, ordered rules with external `rule-providers`, DNS policy and
@@ -54,6 +66,9 @@
 - 数据库迁移 version 6 `ix_remote_port_refs` 为共享远端端口引用查询增加索引。
 
 ### Fixed
+- `X-Subagg-Warning` 截断标记可能是非 latin1 字符，导致 Node 直接拒绝整个响应
+  （`Invalid character in header content`）；截断标记改用 ASCII，并新增
+  `X-Subagg-Warning-Count` 头给出完整告警条数。
 - Refined the complete web workspace: desktop navigation no longer repeats the
   sidebar, long profile editors keep save actions visible, sparse friend and IX
   cards use available space, responsive controls remain reachable, login and

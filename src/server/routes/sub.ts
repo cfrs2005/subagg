@@ -34,7 +34,9 @@ function toHeaderValue(value: string, maxLength = 3000): string {
   const encoded = value.replace(/[^\x20-\x7e]/g, (ch) => encodeURIComponent(ch));
   // HTTP 头有总长度上限。编排校验可能一次产生几十条告警，
   // 这里截断而不是让响应头超限导致整个请求失败。
-  return encoded.length > maxLength ? `${encoded.slice(0, maxLength)}…` : encoded;
+  // 截断标记必须用 ASCII —— 头部值里出现非 latin1 字符会让 Node 直接抛错，
+  // 一个诊断头把主功能搞挂就本末倒置了。
+  return encoded.length > maxLength ? `${encoded.slice(0, maxLength)}...` : encoded;
 }
 
 interface SubParams {
@@ -164,6 +166,14 @@ export function createSubRoutes(ctx: AppContext): FastifyPluginAsync {
           explicitTarget: req.query.target,
           userAgent: req.headers['user-agent'],
           base64: req.query.base64 === '0' ? false : undefined,
+          // .conf 输出需要知道自己的 URL（写进 update-url）和节点订阅 URL
+          // （写进头部注释）。其他目标会忽略这两个键。
+          ...(req.query.target === 'conf' || req.query.target === 'shadowrocket.conf'
+            ? {
+                confUrl: `${ctx.config.publicBaseUrl.replace(/\/+$/, '')}/sub/${token}?target=shadowrocket.conf`,
+                subUrl: `${ctx.config.publicBaseUrl.replace(/\/+$/, '')}/sub/${token}`,
+              }
+            : {}),
         });
 
         const bytes = Buffer.byteLength(result.body, 'utf8');

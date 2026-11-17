@@ -23,6 +23,7 @@
 import type { ProxyNode } from '../types.js';
 import { emitClash, type ClashEmitOptions } from './clash.js';
 import { emitShadowrocket, emitV2Ray } from './urilist.js';
+import { emitShadowrocketConf, type ShadowrocketConfOptions } from './shadowrocket-conf.js';
 import {
   isEmitTarget,
   TARGET_LABELS,
@@ -44,6 +45,7 @@ export {
 } from './capability.js';
 export { emitClash, toClashProxy, type ClashEmitOptions } from './clash.js';
 export { emitShadowrocket, emitV2Ray } from './urilist.js';
+export { emitShadowrocketConf, type ShadowrocketConfOptions } from './shadowrocket-conf.js';
 export { emitUri } from './uri.js';
 
 // ─────────────────────────────────────────────────────────────
@@ -244,6 +246,11 @@ export function normalizeTargetAlias(input: string): EmitTarget | undefined {
     case 'sr':
     case 'rocket':
       return 'shadowrocket';
+    case 'conf':
+    case 'srconf':
+    case 'sr-conf':
+    case 'shadowrocketconf':
+      return 'shadowrocket.conf';
     case 'v2rayn':
     case 'v2rayng':
     case 'base64':
@@ -261,6 +268,8 @@ export function normalizeTargetAlias(input: string): EmitTarget | undefined {
 export interface EmitOptions {
   /** 传给 Clash emitter 的选项。其他目标忽略。 */
   clash?: Omit<ClashEmitOptions, 'target'>;
+  /** 传给 Shadowrocket .conf emitter 的选项。其他目标忽略。 */
+  shadowrocketConf?: ShadowrocketConfOptions;
   /** URI 列表是否做 base64 编码。预览时传 false 便于人工核对。 */
   base64?: boolean;
 }
@@ -282,6 +291,8 @@ export function emit(
       return emitClash(nodes, { ...options.clash, target });
     case 'shadowrocket':
       return emitShadowrocket(nodes, options.base64 ?? true);
+    case 'shadowrocket.conf':
+      return emitShadowrocketConf(nodes, options.shadowrocketConf ?? {});
     case 'v2ray':
       return emitV2Ray(nodes, options.base64 ?? true);
   }
@@ -289,7 +300,9 @@ export function emit(
 
 /** 目标格式对应的文件扩展名，用于 Content-Disposition。 */
 export function fileExtensionFor(target: EmitTarget): string {
-  return target === 'clash' || target === 'clash.meta' ? 'yaml' : 'txt';
+  if (target === 'clash' || target === 'clash.meta') return 'yaml';
+  if (target === 'shadowrocket.conf') return 'conf';
+  return 'txt';
 }
 
 /** 目标格式的展示名。 */

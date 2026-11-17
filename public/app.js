@@ -218,6 +218,7 @@ const api = {
 
   get: (path) => api.request('GET', path),
   post: (path, body) => api.request('POST', path, body),
+  put: (path, body) => api.request('PUT', path, body),
   patch: (path, body) => api.request('PATCH', path, body),
   del: (path) => api.request('DELETE', path),
 };
@@ -413,7 +414,80 @@ function renderSettings() {
   grid.innerHTML = `
     <section class="settings-card"><div class="settings-card-head"><div><div class="settings-kicker">SERVICE</div><h2>服务状态</h2></div><span class="status-pill online"><i></i>已连接</span></div><dl class="settings-list"><dt>节点总数</dt><dd>${state.totals.nodes ?? 0}</dd><dt>订阅源</dt><dd>${state.totals.subscriptions ?? 0}</dd><dt>配置文件</dt><dd>${state.totals.profiles ?? 0}</dd><dt>可输出格式</dt><dd>${targetCount} 种</dd></dl><button class="btn-sec" data-action="side-sync">↻ 立即同步订阅</button></section>
     <section class="settings-card"><div class="settings-card-head"><div><div class="settings-kicker">APPEARANCE</div><h2>界面外观</h2></div></div><p class="settings-copy">主题仅保存在当前浏览器，可随时切换。</p><div class="theme-options"><button class="theme-option${dark ? '' : ' active'}" data-action="set-theme" data-theme="light"><span>☼</span><b>浅色</b><small>适合白天使用</small></button><button class="theme-option${dark ? ' active' : ''}" data-action="set-theme" data-theme="dark"><span>◐</span><b>深色</b><small>适合弱光环境</small></button></div></section>
+    <section class="settings-card settings-card-wide"><div class="settings-card-head"><div><div class="settings-kicker">ROUTING</div><h2>默认分流编排</h2></div><span class="pe-count-pill" id="def-orch-pill">…</span></div><p class="settings-copy">对所有<strong>没有单独编排</strong>的配置文件生效，Clash.Meta 与 Shadowrocket 远程配置共用这一份。优先级：配置文件自己的编排 &gt; 这里 &gt; 内置「iOS 迁移」预设。</p><div id="def-orch-body"><p class="settings-copy">加载中…</p></div></section>
     <section class="settings-card settings-card-wide"><div class="settings-card-head"><div><div class="settings-kicker">SAFETY</div><h2>管理访问</h2></div></div><p class="settings-copy">管理凭据只保存在当前浏览器。退出会立即清除本机保存的凭据，不会影响已生成的订阅链接。</p><button class="btn-danger" data-action="logout-from-settings">退出管理台</button></section>`;
+  refreshDefaultOrchestration();
+}
+
+// ── 默认分流编排（全局设置） ─────────────────────────
+//
+// 与 profile 编辑页的编排卡片共用一套交互（JSON 草稿 + 预设 + 导入），
+// 但草稿独立存放 —— 两处同时打开时互不串扰。
+let defaultOrchDraft = null; // null = 尚未从服务端加载
+
+async function refreshDefaultOrchestration() {
+  const body = document.getElementById('def-orch-body');
+  if (!body) return;
+  try {
+    const current = await api.get('/settings/default-orchestration');
+    defaultOrchDraft = current.orchestration ? JSON.stringify(current.orchestration, null, 2) : '';
+    renderDefaultOrchestrationCard(current.source, current.preset);
+  } catch (err) {
+    body.innerHTML = `<p class="settings-copy">读取失败：${esc(err.message)}</p>`;
+  }
+}
+
+function renderDefaultOrchestrationCard(source, preset) {
+  const body = document.getElementById('def-orch-body');
+  const pill = document.getElementById('def-orch-pill');
+  if (!body) return;
+  if (pill) pill.textContent = source === 'custom' ? '自定义' : `预设 · ${preset?.name ?? ''}`;
+
+  const presets = state.meta?.orchestrationPresets ?? [];
+  body.innerHTML = `
+    <div class="pe-orch-toolbar">
+      <select class="select" id="def-orch-preset">
+        <option value="">选择预设…</option>
+        ${presets.map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('')}
+      </select>
+      <button class="mini-btn" data-action="deforch-preset-apply">套用预设</button>
+      <button class="mini-btn" data-action="deforch-format">格式化 JSON</button>
+      <button class="mini-btn" data-action="deforch-clear">清空（回到内置预设）</button>
+      <button class="btn-sec" data-action="deforch-save">保存为默认</button>
+    </div>
+    <textarea class="textarea pe-orch-json" id="def-orch-json" spellcheck="false"
+      placeholder="留空 = 使用内置「iOS 迁移」预设。这里是一份 Orchestration JSON：groups / rules / providers / dns。">${esc(defaultOrchDraft ?? '')}</textarea>
+    <details class="pe-orch-import">
+      <summary>从 Shadowrocket 配置导入</summary>
+      <p>粘贴完整的 .conf 全文。只导入 [Proxy Group] / [Rule] / [Host] / [General]；节点仍由订阅提供。</p>
+      <textarea class="textarea pe-orch-source" id="def-orch-src" spellcheck="false" placeholder="[Proxy Group]&#10;PROXY = select,节点A&#10;&#10;[Rule]&#10;DOMAIN-SUFFIX,openai.com,AI&#10;FINAL,PROXY"></textarea>
+      <button class="mini-btn" data-action="deforch-parse">解析并填入</button>
+    </details>
+    <div class="pe-orch-warnings" id="def-orch-warnings"></div>`;
+}
+
+function parseDefaultOrchDraft() {
+  const text = (defaultOrchDraft ?? '').trim();
+  if (!text) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    throw new Error(`编排 JSON 解析失败：${err.message}`);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('编排必须是一个 JSON 对象');
+  }
+  if (!Array.isArray(parsed.groups) || !Array.isArray(parsed.rules)) {
+    throw new Error('编排必须包含 groups 与 rules 两个数组');
+  }
+  return parsed;
+}
+
+function writeDefaultOrchDraft(value) {
+  defaultOrchDraft = value;
+  const textarea = document.getElementById('def-orch-json');
+  if (textarea) textarea.value = value;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1672,11 +1746,24 @@ function writeOrchestrationDraft(value) {
   const textarea = document.getElementById('p-orch-json');
   if (textarea) textarea.value = value;
   const pill = document.querySelector('.pe-orch-card .pe-count-pill');
-  if (pill) pill.textContent = value.trim() ? '已启用' : '内置模板';
+  if (pill) pill.textContent = value.trim() ? '已启用' : '跟随全局默认';
 }
 
 function renderOrchestrationWarnings(warnings) {
   const el = document.getElementById('p-orch-warnings');
+  if (!el) return;
+  if (!warnings?.length) {
+    el.innerHTML = '';
+    return;
+  }
+  el.innerHTML = `<strong>导入提示（${warnings.length}）</strong><ul>${warnings
+    .map((warning) => `<li>${esc(warning)}</li>`)
+    .join('')}</ul>`;
+}
+
+/** 系统设置页「默认分流编排」卡片的导入提示，与 profile 侧同一形态。 */
+function renderDefaultOrchestrationWarnings(warnings) {
+  const el = document.getElementById('def-orch-warnings');
   if (!el) return;
   if (!warnings?.length) {
     el.innerHTML = '';
@@ -2056,7 +2143,7 @@ function renderProductProfilePage() {
                 <h2>Clash 分流编排</h2>
                 <p>留空 = 使用内置模板。Clash.Meta 客户端会拿到这里的 proxy-groups、rules、rule-providers 与 dns；Shadowrocket 订阅只带节点，不受影响。</p>
               </div>
-              <span class="pe-count-pill">${orchestrationDraft.trim() ? '已启用' : '内置模板'}</span>
+              <span class="pe-count-pill">${orchestrationDraft.trim() ? '已启用' : '跟随全局默认'}</span>
             </div>
             <div class="pe-orch-toolbar">
               <select class="select" id="p-orch-preset">
@@ -2065,10 +2152,10 @@ function renderProductProfilePage() {
               </select>
               <button class="mini-btn" data-action="apply-orchestration-preset">套用预设</button>
               <button class="mini-btn" data-action="format-orchestration">格式化 JSON</button>
-              <button class="mini-btn" data-action="clear-orchestration">清空（回到内置模板）</button>
+              <button class="mini-btn" data-action="clear-orchestration">清空（跟随全局默认）</button>
             </div>
             <textarea class="textarea pe-orch-json" id="p-orch-json" spellcheck="false"
-              placeholder="留空即使用内置模板。启用后这里是一份 Orchestration JSON：groups / rules / providers / dns。">${esc(orchestrationDraft)}</textarea>
+              placeholder="留空 = 跟随全局默认（系统设置 → 默认分流编排）。启用后这里是一份 Orchestration JSON：groups / rules / providers / dns。">${esc(orchestrationDraft)}</textarea>
             <details class="pe-orch-import">
               <summary>从 Shadowrocket 配置导入</summary>
               <p>粘贴完整的 .conf 全文。只导入 [Proxy Group] / [Rule] / [Host] / [General]；节点仍由订阅提供。</p>
@@ -2327,6 +2414,7 @@ function linksModal(profileId) {
           t.revoked
             ? `<span class="ptag">已吊销</span><button class="icobtn" data-action="token-access" data-token="${esc(t.token)}">📊</button><button class="icobtn danger" data-action="delete-token" data-token="${esc(t.token)}">🗑 清理</button>`
             : `<button class="icobtn" data-action="copy-token" data-url="${esc(t.url)}">复制</button>
+               <button class="icobtn" data-action="copy-token" data-url="${esc(`${t.url}?target=shadowrocket.conf`)}" title="Shadowrocket 远程配置（完整分流）">复制.conf</button>
                <button class="icobtn" data-action="token-qr" data-token="${esc(t.token)}" data-id="${esc(profileId)}" data-value="${esc(t.label || '未命名')}">二维码</button>
                <button class="icobtn" data-action="edit-token" data-token="${esc(t.token)}">编辑</button>
                <button class="icobtn" data-action="token-access" data-token="${esc(t.token)}">📊</button>
@@ -2345,7 +2433,10 @@ function linksModal(profileId) {
     <div class="modal-hint" style="margin-top:14px">
       <strong>一条链接，各客户端通用。</strong>
       Clash / Clash.Meta / Shadowrocket / v2rayN 会被自动识别，各自拿到对应格式；
-      需要强制指定时在链接后加 <code>?target=clash.meta</code>（可选值：clash、clash.meta、shadowrocket、v2ray）。<br><br>
+      需要强制指定时在链接后加 <code>?target=clash.meta</code>（可选值：clash、clash.meta、shadowrocket、shadowrocket.conf、v2ray）。<br><br>
+      <strong>Shadowrocket 想要完整分流？</strong>把 <code>?target=shadowrocket.conf</code>
+      这条加为 App 的「远程配置」（节点订阅仍用上面那条原始链接），分组、规则、DNS
+      会与 Clash 侧同一份编排一起下发，改策略只需在站点改一次。<br><br>
       <strong>二维码本地生成。</strong>这条链接等同于你全部节点的访问凭证，
       所以它不会被交给任何第三方二维码服务 —— 码由本服务自己算出来，全程零外部请求。
       也正因为如此，请继续把它当凭证看待：别让它出现在直播画面、会议投屏或公开截图里。
@@ -3030,8 +3121,80 @@ document.addEventListener('click', async (e) => {
       case 'clear-orchestration':
         writeOrchestrationDraft('');
         renderOrchestrationWarnings([]);
-        toast('已回到内置模板；保存后生效');
+        toast('已清空；保存后该配置文件将跟随全局默认编排');
         break;
+
+      // ── 默认分流编排（系统设置） ──
+      case 'deforch-preset-apply': {
+        const presetId = document.getElementById('def-orch-preset')?.value ?? '';
+        const preset = (state.meta?.orchestrationPresets ?? []).find((item) => item.id === presetId);
+        if (!preset) {
+          toast('请先选择一个预设', 'warn');
+          break;
+        }
+        writeDefaultOrchDraft(JSON.stringify(preset.orchestration, null, 2));
+        renderDefaultOrchestrationWarnings([]);
+        toast(`已套用「${preset.name}」，记得点「保存为默认」`);
+        break;
+      }
+
+      case 'deforch-format': {
+        try {
+          const parsed = parseDefaultOrchDraft();
+          writeDefaultOrchDraft(parsed ? JSON.stringify(parsed, null, 2) : '');
+          toast('已格式化');
+        } catch (err) {
+          toast(err.message, 'error');
+        }
+        break;
+      }
+
+      case 'deforch-clear':
+        writeDefaultOrchDraft('');
+        renderDefaultOrchestrationWarnings([]);
+        toast('已清空；保存后回到内置「iOS 迁移」预设');
+        break;
+
+      case 'deforch-parse': {
+        const source = document.getElementById('def-orch-src')?.value.trim() ?? '';
+        if (!source) {
+          toast('请先粘贴 Shadowrocket 配置', 'warn');
+          break;
+        }
+        try {
+          const result = await api.post('/orchestration/parse', { text: source });
+          writeDefaultOrchDraft(JSON.stringify(result.orchestration, null, 2));
+          renderDefaultOrchestrationWarnings(result.warnings);
+          toast(
+            `已解析：${result.orchestration.groups.length} 个分组、${result.orchestration.rules.length} 条规则，记得点「保存为默认」`,
+          );
+        } catch (err) {
+          toast(err.message, 'error');
+        }
+        break;
+      }
+
+      case 'deforch-save': {
+        let orchestration;
+        try {
+          orchestration = parseDefaultOrchDraft();
+        } catch (err) {
+          toast(err.message, 'error');
+          break;
+        }
+        try {
+          const result = await api.put('/settings/default-orchestration', { orchestration });
+          const pill = document.getElementById('def-orch-pill');
+          if (pill) {
+            pill.textContent =
+              result.source === 'custom' ? '自定义' : `预设 · ${result.preset?.name ?? ''}`;
+          }
+          toast(orchestration ? '默认编排已保存，即刻对所有未单独编排的配置生效' : '已清除自定义默认，回到内置预设');
+        } catch (err) {
+          toast(err.message, 'error');
+        }
+        break;
+      }
 
       case 'parse-orchestration': {
         const source = document.getElementById('p-orch-src').value.trim();
@@ -3397,7 +3560,10 @@ document.addEventListener('input', (e) => {
     // 只更新草稿，不实时 JSON.parse —— 用户打到一半必然不合法。
     orchestrationDraft = e.target.value;
     const pill = document.querySelector('.pe-orch-card .pe-count-pill');
-    if (pill) pill.textContent = orchestrationDraft.trim() ? '已启用' : '内置模板';
+    if (pill) pill.textContent = orchestrationDraft.trim() ? '已启用' : '跟随全局默认';
+  }
+  if (e.target.id === 'def-orch-json') {
+    defaultOrchDraft = e.target.value;
   }
 });
 document.addEventListener('change', (e) => {

@@ -24,7 +24,7 @@ import type { AppContext } from '../../context.js';
 import { EMIT_TARGETS, TARGET_LABELS, emitUri, type EmitTarget } from '../../core/emit/index.js';
 import { applyFilter, DEFAULT_EXCLUDE_PATTERNS, type FilterRule } from '../../core/filter.js';
 import { parseShadowrocketConf } from '../../core/orchestrate-import.js';
-import { ORCHESTRATION_PRESETS } from '../../core/orchestrate-presets.js';
+import { ORCHESTRATION_PRESETS, IOS_MIGRATED } from '../../core/orchestrate-presets.js';
 import { parseUri } from '../../core/parse/index.js';
 import { knownRegionCodes, regionNameZh, regionToFlag } from '../../core/region.js';
 import { encodeQr, renderQrSvg } from '../../core/qrcode.js';
@@ -208,6 +208,7 @@ const TARGET_VALUES = [
   'clash',
   'clash.meta',
   'shadowrocket',
+  'shadowrocket.conf',
   'v2ray',
 ] as const satisfies readonly EmitTarget[];
 
@@ -695,7 +696,8 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
           description: '',
           icon: '👁',
           rule,
-          orchestration: parsed.data.orchestration ?? null,
+          // 编排经由下方 options 传入（预览读全局默认），这里恒为 null。
+          orchestration: null,
           defaultTarget: parsed.data.target ?? 'shadowrocket',
           userinfoMode: 'sum',
           updateInterval: 12,
@@ -707,9 +709,13 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
           // 预览时不做 base64：一坨 base64 对人类没有任何信息量
           base64: false,
           limitOverride: parsed.data.limit ?? 50,
-          // 预览是独立的一次性渲染，不读取任何已保存 profile 的编排；
-          // 没传就按内置模板渲染。
-          orchestration: parsed.data.orchestration ?? null,
+          // 预览是独立渲染，读不到具体 profile；全局默认属于"所有 profile
+          // 共享"的部分，所以没传编排时按全局默认（再兜底预设）走，
+          // 预览结果才贴近真实订阅输出。
+          orchestration:
+            parsed.data.orchestration === undefined
+              ? (ctx.settings.getDefaultOrchestration() ?? IOS_MIGRATED)
+              : parsed.data.orchestration,
         },
       );
 
@@ -751,6 +757,35 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
       if (!parsed.success) return reply.code(400).send(badRequest(parsed.error.issues));
 
       return parseShadowrocketConf(parsed.data.text);
+    });
+
+    // ── 全局默认编排 ──────────────────────────────────
+    //
+    // 优先级：profile 自己的编排 > 这里的全局默认 > 代码内置的 IOS_MIGRATED
+    // 预设。清除（PUT null）= 回到内置预设，不会回到"通用模板"——
+    // 这是个单用户站点，站点所有者的策略就是默认分流。
+    app.get('/settings/default-orchestration', async () => {
+      const custom = ctx.settings.getDefaultOrchestration();
+      return {
+        orchestration: custom,
+        // 界面据此展示"当前生效的是自定义还是内置预设"。
+        source: custom ? 'custom' : 'preset',
+        preset: { id: 'ios-migrated', name: 'iOS 迁移（Shadowrocket）' },
+      };
+    });
+
+    app.put('/settings/default-orchestration', async (req, reply) => {
+      const parsed = z
+        .object({ orchestration: OrchestrationSchema.nullable() })
+        .safeParse(req.body);
+      if (!parsed.success) return reply.code(400).send(badRequest(parsed.error.issues));
+
+      ctx.settings.setDefaultOrchestration(parsed.data.orchestration);
+      return {
+        orchestration: ctx.settings.getDefaultOrchestration(),
+        source: parsed.data.orchestration ? 'custom' : 'preset',
+        preset: { id: 'ios-migrated', name: 'iOS 迁移（Shadowrocket）' },
+      };
     });
 
     // ── IX 中转 ───────────────────────────────────────

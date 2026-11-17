@@ -14,6 +14,7 @@ import { AuthRepo } from './db/repo/auth.js';
 import { NodeRepo } from './db/repo/nodes.js';
 import { PingHistoryRepo } from './db/repo/ping-history.js';
 import { ProfileRepo } from './db/repo/profiles.js';
+import { SettingsRepo } from './db/repo/settings.js';
 import { AccessLogRepo, FriendRepo, TokenRepo } from './db/repo/sharing.js';
 import { SubscriptionRepo, TrafficRepo } from './db/repo/subscriptions.js';
 import type { Logger } from './logger.js';
@@ -41,6 +42,7 @@ export interface AppContext {
   pingHistory: PingHistoryRepo;
   ixProviders: IxProviderRepo;
   ixMappings: IxMappingRepo;
+  settings: SettingsRepo;
 
   sync: SyncService;
   nodePing: NodePingService;
@@ -67,6 +69,7 @@ export function createContext(config: Config, logger: Logger): AppContext {
   const pingHistory = new PingHistoryRepo(db);
   const ixProviders = new IxProviderRepo(db);
   const ixMappings = new IxMappingRepo(db);
+  const settings = new SettingsRepo(db);
 
   const limitStats = new LimitStats();
   const sync = new SyncService({ config, logger, subscriptions, nodes, traffic });
@@ -110,6 +113,7 @@ export function createContext(config: Config, logger: Logger): AppContext {
     traffic,
     friends,
     tokens,
+    settings,
     accessLog,
     auth,
     pingHistory,
