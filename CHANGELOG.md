@@ -6,6 +6,37 @@
 ## [Unreleased]
 
 ### Added
+- Rule-set translation endpoint `GET /r/:token/:key`. Rule sets are fetched and
+  normalised server-side, so `rule-providers[].url` always points at a format the
+  target `behavior` actually understands. Shadowrocket's leading-dot lists
+  (`.example.com`, 110k lines) are rewritten to Clash's `+.example.com`;
+  GitHub `blob/` URLs returning HTML are rejected instead of being handed to the
+  client as an empty rule set. Keys are resolved against the profile's
+  orchestration only, so the endpoint cannot be used as an open proxy. When a
+  source cannot be converted the request is redirected to the upstream URL, and
+  a stale cache is served rather than nothing.
+- mihomo-native top-level fields for `clash.meta`: `profile.store-selected`
+  (manual egress choice survives subscription refreshes),
+  `profile.store-fake-ip`, `sniffer` (domain rules now match IP-only
+  connections under TUN), `unified-delay` (delay figures match Shadowrocket's
+  single-request measurement) and `tcp-concurrent`.
+- `default-nameserver` and `proxy-server-nameserver` in the DNS section: DoH
+  servers addressed by hostname and proxy-server domains no longer depend on a
+  lucky `hosts:` entry or create a resolution loop.
+
+### Fixed
+- `rule-providers` without an explicit `format` were parsed as YAML by mihomo,
+  silently producing an **empty** rule set. Every rule set declared in
+  orchestration now emits `format: text` unless another format is requested.
+- Shadowrocket `dns-server = ...#proxy` no longer loses its suffix. It maps to
+  mihomo's `#策略名` (`...dns-query#PROXY`), which is then validated against the
+  rendered groups: a suffix naming a group that does not exist is dropped with a
+  warning instead of breaking the whole config.
+- Explicit `DOMAIN` / `DOMAIN-SUFFIX` rules with policy `DIRECT` are now also
+  added to `fake-ip-filter`. Without it, internal domains received a `198.18.x.x`
+  fake address and "direct" connections failed with an unroutable target.
+- `rule-providers` are downloaded with `proxy: DIRECT` when the URL points at
+  this server, removing the "rules are needed to fetch the rules" startup cycle.
 - Shadowrocket can now receive the **full routing policy** from the site: the same
   profile/token also serves `?target=shadowrocket.conf`, a complete remote config
   (groups with real node names, rules with `FINAL` and raw `RULE-SET` URLs,

@@ -47,6 +47,20 @@ function safeToken(value: string): boolean {
   return value.length > 0 && !/[,\r\n]/.test(value);
 }
 
+/**
+ * `#PROXY` 是 mihomo 的策略名写法；Shadowrocket 只有一个内置的 `#proxy`，
+ * 意思是「用当前出口解析」。反向输出时换回去，否则 App 不认这个后缀。
+ */
+function toShadowrocketDns(server: string): string {
+  const hash = server.indexOf('#');
+  if (hash === -1) return server;
+
+  const base = server.slice(0, hash);
+  const via = server.slice(hash + 1);
+  if (/^h3$/i.test(via)) return server;
+  return `${base}#proxy`;
+}
+
 function formatGroup(name: string, type: string, members: readonly string[], options: readonly string[]): string {
   return [`${name} = ${type}`, ...members, ...options].join(',');
 }
@@ -176,10 +190,10 @@ export function emitShadowrocketConf(
     // ── DNS 反向翻译 ─────────────────────────────────
     const dns = options.orchestration.dns;
     if (dns?.nameserver?.length) {
-      general.push(`dns-server = ${dns.nameserver.join(',')}`);
+      general.push(`dns-server = ${dns.nameserver.map(toShadowrocketDns).join(',')}`);
     }
     if (dns?.fallback?.length) {
-      general.push(`fallback-dns-server = ${dns.fallback.join(',')}`);
+      general.push(`fallback-dns-server = ${dns.fallback.map(toShadowrocketDns).join(',')}`);
     }
     for (const [domain, server] of Object.entries(dns?.nameserverPolicy ?? {})) {
       const value = Array.isArray(server) ? server[0] : server;

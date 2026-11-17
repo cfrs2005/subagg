@@ -270,6 +270,118 @@ describe('emitClash 与编排', () => {
     expect(config['ipv6']).toBe(false);
   });
 
+  it('mihomo 原生顶层：手动选择持久化、域名嗅探、延迟口径', () => {
+    const result = emitClash(nodes, {
+      target: 'clash.meta',
+      orchestration: {
+        groups: [{ name: 'PROXY', type: 'select', members: [{ kind: 'nodes', select: {} }] }],
+        rules: [{ type: 'MATCH', policy: 'PROXY' }],
+      },
+    });
+
+    const config = parseYaml(result.body) as Record<string, unknown>;
+    // 少了 store-selected，订阅一刷新手动选的出口就被重置 —— 这是从
+    // Shadowrocket 迁过来最刺眼的差异。
+    expect(config['profile']).toEqual({ 'store-selected': true, 'store-fake-ip': true });
+    expect(config['unified-delay']).toBe(true);
+    expect(config['tcp-concurrent']).toBe(true);
+    expect(config['sniffer']).toMatchObject({ enable: true, 'parse-pure-ip': true });
+
+    // 原版 Clash 内核不认这些键，多写会让整份配置加载失败。
+    const plain = emitClash(nodes, { target: 'clash' });
+    const plainConfig = parseYaml(plain.body) as Record<string, unknown>;
+    expect(plainConfig['profile']).toBeUndefined();
+    expect(plainConfig['sniffer']).toBeUndefined();
+    expect(plainConfig['unified-delay']).toBeUndefined();
+  });
+
+  it('DNS：保留 #策略名、补齐 bootstrap DNS、直连域名进 fake-ip-filter', () => {
+    const result = emitClash(nodes, {
+      target: 'clash.meta',
+      orchestration: {
+        groups: [{ name: 'PROXY', type: 'select', members: [{ kind: 'nodes', select: {} }] }],
+        rules: [
+          { type: 'DOMAIN-SUFFIX', value: 'gs-robot.com', policy: 'DIRECT' },
+          { type: 'MATCH', policy: 'PROXY' },
+        ],
+        dns: {
+          nameserver: ['https://dns.google/dns-query#PROXY'],
+          fakeIpFilter: ['+.20260401.xyz'],
+        },
+      },
+    });
+
+    const dns = (parseYaml(result.body) as Record<string, Record<string, unknown>>)['dns']!;
+    // `#proxy` 不是"无法表达"：mihomo 用 `#策略名`，丢后缀会让 DoH 退回直连解析。
+    expect(dns['nameserver']).toEqual(['https://dns.google/dns-query#PROXY']);
+    expect(dns['default-nameserver']).toEqual(['223.5.5.5', '119.29.29.29']);
+    expect(dns['proxy-server-nameserver']).toEqual(['223.5.5.5', '119.29.29.29']);
+    // 规则说直连，DNS 就必须给真实 IP，否则内网域名拿到 198.18.x.x 谁都不认识。
+    expect(dns['fake-ip-filter']).toEqual(['+.20260401.xyz', '+.gs-robot.com']);
+  });
+
+  it('DNS 出口指向不存在的策略时剥掉后缀并告警', () => {
+    const result = emitClash(nodes, {
+      target: 'clash.meta',
+      orchestration: {
+        groups: [{ name: 'PROXY', type: 'select', members: [{ kind: 'nodes', select: {} }] }],
+        rules: [{ type: 'MATCH', policy: 'PROXY' }],
+        dns: { nameserver: ['https://dns.google/dns-query#NOPE'] },
+      },
+    });
+
+    const dns = (parseYaml(result.body) as Record<string, Record<string, unknown>>)['dns']!;
+    expect(dns['nameserver']).toEqual(['https://dns.google/dns-query']);
+    expect(result.warnings?.some((warning) => warning.includes('NOPE'))).toBe(true);
+  });
+
+  it('ruleProxyBase 把 rule-providers 指向本站转换端点', () => {
+    const result = emitClash(nodes, {
+      target: 'clash.meta',
+      ruleProxyBase: 'https://sub.example.com/r/TOKEN',
+      orchestration: {
+        groups: [{ name: 'PROXY', type: 'select', members: [{ kind: 'nodes', select: {} }] }],
+        providers: {
+          openai: { url: 'https://upstream.example.com/openai.list', behavior: 'classical' },
+        },
+        rules: [
+          { type: 'RULE-SET', value: 'openai', policy: 'PROXY' },
+          { type: 'MATCH', policy: 'PROXY' },
+        ],
+      },
+    });
+
+    const config = parseYaml(result.body) as Record<string, unknown>;
+    expect(config['rule-providers']).toMatchObject({
+      openai: {
+        url: 'https://sub.example.com/r/TOKEN/openai',
+        // 规则集在自家域名下，下载必须直连：否则「用规则决定怎么下规则」死锁。
+        proxy: 'DIRECT',
+        // 不显式写 format，mihomo 会按 yaml 解析纯文本，静默得到空集。
+        format: 'text',
+      },
+    });
+  });
+
+  it('规则集缺省格式必须是 text，否则 mihomo 按 yaml 解析成空集', () => {
+    const result = emitClash(nodes, {
+      target: 'clash.meta',
+      orchestration: {
+        groups: [{ name: 'PROXY', type: 'select', members: [{ kind: 'nodes', select: {} }] }],
+        providers: {
+          openai: { url: 'https://upstream.example.com/openai.list', behavior: 'classical' },
+        },
+        rules: [
+          { type: 'RULE-SET', value: 'openai', policy: 'PROXY' },
+          { type: 'MATCH', policy: 'PROXY' },
+        ],
+      },
+    });
+
+    const config = parseYaml(result.body) as Record<string, Record<string, { format?: string }>>;
+    expect(config['rule-providers']?.['openai']?.format).toBe('text');
+  });
+
   it('原版 Clash 目标忽略编排并给出警告', () => {
     const result = emitClash(nodes, {
       target: 'clash',

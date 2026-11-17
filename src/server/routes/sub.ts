@@ -162,16 +162,20 @@ export function createSubRoutes(ctx: AppContext): FastifyPluginAsync {
         }
 
         // ── 2. 渲染 ────────────────────────────────────
+        const baseUrl = ctx.config.publicBaseUrl.replace(/\/+$/, '');
         const result = renderProfile(ctx, profile, {
           explicitTarget: req.query.target,
           userAgent: req.headers['user-agent'],
           base64: req.query.base64 === '0' ? false : undefined,
+          // rule-providers 指向本站的规则集转换端点：源站的格式差异
+          // （SR 前导点、GitHub blob、扩展名拼错）在这里被一次性吃掉。
+          ruleProxyBase: `${baseUrl}/r/${token}`,
           // .conf 输出需要知道自己的 URL（写进 update-url）和节点订阅 URL
           // （写进头部注释）。其他目标会忽略这两个键。
           ...(req.query.target === 'conf' || req.query.target === 'shadowrocket.conf'
             ? {
-                confUrl: `${ctx.config.publicBaseUrl.replace(/\/+$/, '')}/sub/${token}?target=shadowrocket.conf`,
-                subUrl: `${ctx.config.publicBaseUrl.replace(/\/+$/, '')}/sub/${token}`,
+                confUrl: `${baseUrl}/sub/${token}?target=shadowrocket.conf`,
+                subUrl: `${baseUrl}/sub/${token}`,
               }
             : {}),
         });

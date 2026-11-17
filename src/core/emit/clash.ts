@@ -22,7 +22,11 @@
 
 import { stringify as stringifyYaml } from 'yaml';
 import { regionNameZh, regionToFlag } from '../region.js';
-import { resolveOrchestration, type Orchestration } from '../orchestrate.js';
+import {
+  resolveOrchestration,
+  type Orchestration,
+  type OrchestrationProvider,
+} from '../orchestrate.js';
 import type { ProxyNode, TlsOptions, Transport } from '../types.js';
 import { partitionBySupport, type EmitResult } from './capability.js';
 
@@ -42,6 +46,17 @@ export interface ClashEmitOptions {
    * 塞给原版 Clash 会导致整份配置加载失败。
    */
   orchestration?: Orchestration;
+  /**
+   * 规则集转换端点的基址，形如 `https://host/r/<token>`。
+   *
+   * 给出后，`rule-providers[].url` 改写为 `<base>/<providerKey>`。
+   * 为什么必须改写：源站格式五花八门（SR 前导点、GitHub blob 的 HTML、
+   * 扩展名拼错），客户端不会替你猜。转换放在服务端做一次，
+   * 客户端只拿目标 behavior 对应的干净格式。
+   *
+   * 不给则保留原始 URL —— 预览路径就是这样，输出与线上会差这一点。
+   */
+  ruleProxyBase?: string;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -57,6 +72,41 @@ const GROUP_CHAIN = '🔗 链式落地';
 const GROUP_ENTRY = '🚪 入口节点';
 
 const DEFAULT_TEST_URL = 'http://www.gstatic.com/generate_204';
+
+/**
+ * mihomo 专属的顶层字段。这些不是"锦上添花"，每一条都对应一个真实差异 ——
+ * 少了它们，从 Shadowrocket 迁过来的人会立刻觉得「这客户端是坏的」。
+ *
+ * | 字段 | 缺了会怎样 |
+ * |---|---|
+ * | `profile.store-selected` | 订阅一刷新，手动选中的出口被重置回第一个成员。SR 是永远记住的 |
+ * | `profile.store-fake-ip` | fake-ip 映射不持久，重启后同一域名换 IP，连接被误判 |
+ * | `sniffer` | 规则几乎全是域名规则，但 TUN 下只拿到 IP，域名规则根本不参与匹配 |
+ * | `unified-delay` | 延迟含 TLS 握手，比 SR 报的数大两三倍，用户以为线路劣化 |
+ * | `tcp-concurrent` | 同一域名多个 IP 串行尝试，首字节时间明显变长 |
+ */
+function metaTopLevel(): Record<string, unknown> {
+  return {
+    'unified-delay': true,
+    'tcp-concurrent': true,
+    profile: {
+      'store-selected': true,
+      'store-fake-ip': true,
+    },
+    sniffer: {
+      enable: true,
+      // 纯 IP 连接也尝试嗅探：TUN 转发过来时目标只有 IP，没有域名。
+      'parse-pure-ip': true,
+      // 嗅探到的域名只用于规则匹配，不改写连接目标 —— 改写会破坏 SNI 校验。
+      'override-destination': false,
+      sniff: {
+        TLS: { ports: [443, 8443] },
+        HTTP: { ports: [80, 8080] },
+        QUIC: { ports: [443] },
+      },
+    },
+  };
+}
 
 // ─────────────────────────────────────────────────────────────
 //  节点 → Clash proxy
@@ -368,6 +418,25 @@ function buildRules(): string[] {
 // ─────────────────────────────────────────────────────────────
 
 /**
+ * 把 `rule-providers` 的 URL 指向本站转换端点。
+ *
+ * 返回新对象，**绝不改原 spec** —— `.conf` 的 emitter 还要用原始 URL 回填
+ * `RULE-SET,<url>,<policy>`：Shadowrocket 本来就能直吃 Surge 格式，
+ * 让它绕一圈经过我们的 Clash 格式转换反而是倒退。
+ */
+function localizeProviders(spec: Orchestration, base: string): Orchestration {
+  const providers = spec.providers;
+  if (!providers) return spec;
+
+  const prefix = base.replace(/\/+$/, '');
+  const rewritten: Record<string, OrchestrationProvider> = {};
+  for (const [key, provider] of Object.entries(providers)) {
+    rewritten[key] = { ...provider, url: `${prefix}/${encodeURIComponent(key)}` };
+  }
+  return { ...spec, providers: rewritten };
+}
+
+/**
  * 生成 Clash YAML 配置。
  *
  * 不支持的节点会被跳过并记入返回值的 `skipped`，由调用方负责上报给用户。
@@ -387,7 +456,21 @@ export function emitClash(nodes: readonly ProxyNode[], options: ClashEmitOptions
         '自定义编排包含 rule-providers / DNS 等 mihomo 专属能力，当前目标不是 Clash.Meta，已回退内置模板',
       );
     } else {
-      orchestration = resolveOrchestration(usable, options.orchestration);
+      const spec = options.ruleProxyBase
+        ? localizeProviders(options.orchestration, options.ruleProxyBase)
+        : options.orchestration;
+      orchestration = resolveOrchestration(usable, spec);
+
+      // 规则集下载必须直连。规则集就在我们自己的域名下，而"用规则决定怎么
+      // 下载规则"是死锁：首次启动规则集为空，下载请求会一路走到 MATCH，
+      // 被塞进一个可能还没测通的节点，于是规则集永远下不下来。
+      // 实测 mihomo 1.19.25：不配 proxy 时确实会走代理栈。
+      if (options.ruleProxyBase) {
+        for (const provider of Object.values(orchestration.providers)) {
+          provider.proxy = 'DIRECT';
+        }
+      }
+
       warnings.push(...orchestration.warnings);
     }
   }
@@ -400,6 +483,12 @@ export function emitClash(nodes: readonly ProxyNode[], options: ClashEmitOptions
     mode: 'rule',
     'log-level': 'info',
   };
+
+  // 只有 mihomo 认这些字段。原版 Clash 内核遇到未知键会直接拒绝加载，
+  // 不能靠"多写无所谓"来处理。
+  if (target === 'clash.meta') {
+    Object.assign(config, metaTopLevel());
+  }
 
   if (orchestration?.ipv6 !== undefined) config['ipv6'] = orchestration.ipv6;
   if (orchestration?.hosts) config['hosts'] = orchestration.hosts;

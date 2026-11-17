@@ -23,6 +23,7 @@ import { hashIp } from '../db/repo/sharing.js';
 import { createAdminRoutes } from './routes/admin.js';
 import { createAuthRoutes } from './routes/auth.js';
 import { createIxRoutes } from './routes/ix.js';
+import { createRuleRoutes } from './routes/rules.js';
 import { createSubRoutes } from './routes/sub.js';
 
 /**
@@ -163,6 +164,8 @@ export async function buildApp(ctx: AppContext): Promise<FastifyInstance> {
 
   // ── 路由 ──────────────────────────────────────────────
   await app.register(createSubRoutes(ctx), { prefix: '/sub' });
+  // 规则集转换端点。用订阅 token 鉴权，与 /sub 同源同权限。
+  await app.register(createRuleRoutes(ctx), { prefix: '/r' });
   await app.register(createAuthRoutes(ctx), { prefix: '/auth' });
   await app.register(createAdminRoutes(ctx), { prefix: '/api' });
   // IX 中转是 `/api` 下的一组，但**是独立插件**：Fastify 的 hook 按封装上下文

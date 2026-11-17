@@ -375,3 +375,41 @@ describe('配置文件编排端到端', () => {
     expect(Array.isArray(result.warnings)).toBe(true);
   });
 });
+
+describe('规则集转换端点', () => {
+  it('订阅端点把 rule-providers 指向本站，且用 token 取回转换结果', async () => {
+    const { app, ctx } = await setup();
+    const profileId = await createProfile(app);
+    const token = await createToken(app, profileId);
+
+    // 不打网络：转换本身由 rule-set 单测覆盖，这里只验路由与鉴权。
+    ctx.ruleCache.get = async () => ({ body: 'DOMAIN-SUFFIX,openai.com\n', stale: false, count: 1 });
+
+    const clash = await app.inject({
+      method: 'GET',
+      url: `/sub/${token}`,
+      headers: { 'user-agent': 'clash-verge/v2.2.0' },
+    });
+    const config = parseYaml(clash.body) as Record<string, unknown>;
+    expect(config['rule-providers']).toMatchObject({
+      openai: { url: `http://127.0.0.1:8787/r/${token}/openai` },
+    });
+
+    const rule = await app.inject({ method: 'GET', url: `/r/${token}/openai` });
+    expect(rule.statusCode).toBe(200);
+    expect(rule.body).toContain('DOMAIN-SUFFIX,openai.com');
+    expect(rule.headers['x-subagg-rule-count']).toBe('1');
+  });
+
+  it('未声明的 key 与无效 token 都返回 404（不做开放代理）', async () => {
+    const { app } = await setup();
+    const profileId = await createProfile(app);
+    const token = await createToken(app, profileId);
+
+    const unknown = await app.inject({ method: 'GET', url: `/r/${token}/not-declared` });
+    expect(unknown.statusCode).toBe(404);
+
+    const badToken = await app.inject({ method: 'GET', url: '/r/nope/openai' });
+    expect(badToken.statusCode).toBe(404);
+  });
+});

@@ -18,7 +18,9 @@ import { SettingsRepo } from './db/repo/settings.js';
 import { AccessLogRepo, FriendRepo, TokenRepo } from './db/repo/sharing.js';
 import { SubscriptionRepo, TrafficRepo } from './db/repo/subscriptions.js';
 import type { Logger } from './logger.js';
+import path from 'node:path';
 import { IxService } from './services/ix.js';
+import { RuleCache } from './services/rule-cache.js';
 import { GoogleOidcService } from './services/google-oidc.js';
 import { LimitStats } from './services/limit-stats.js';
 import { Scheduler } from './services/scheduler.js';
@@ -50,6 +52,8 @@ export interface AppContext {
   catalog: NodeCatalog;
   googleOidc: GoogleOidcService | null;
   scheduler: Scheduler;
+  /** 规则集抓取与格式归一。`/r/:token/:key` 的缓存后端。 */
+  ruleCache: RuleCache;
   /** 限流命中计数。进程内，重启清零 —— 展示时必须带上 since。 */
   limitStats: LimitStats;
 }
@@ -70,6 +74,13 @@ export function createContext(config: Config, logger: Logger): AppContext {
   const ixProviders = new IxProviderRepo(db);
   const ixMappings = new IxMappingRepo(db);
   const settings = new SettingsRepo(db);
+
+  // 规则集缓存放在数据库旁边（`data/rules`）而不是系统临时目录：
+  // 重启后还要能用，且要和 `data/` 一起被备份 / 迁移脚本覆盖到。
+  const ruleCache = new RuleCache({
+    dir: path.join(path.dirname(config.dbPath), 'rules'),
+    logger: logger.child({ module: 'rule-cache' }),
+  });
 
   const limitStats = new LimitStats();
   const sync = new SyncService({ config, logger, subscriptions, nodes, traffic });
@@ -125,6 +136,7 @@ export function createContext(config: Config, logger: Logger): AppContext {
     catalog,
     googleOidc,
     scheduler,
+    ruleCache,
     limitStats,
   };
 }

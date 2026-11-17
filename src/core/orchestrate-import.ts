@@ -21,7 +21,9 @@
  * - `USER-AGENT` / `URL-REGEX` / `PROCESS-NAME` 等 Surge 专有规则类型
  * - `policy-select-name`：Clash 的 url-test 没有"首选"，外层包一个 select 来还原
  * - `skip-proxy` 的 `bypass-system` 语义：Clash 没有系统代理绕过，只能落成规则
- * - `#proxy` 后缀：Clash 不能为单个 DoH 服务器指定出口
+ *
+ * `#proxy` 后缀**不在**"翻译不了"之列：mihomo 用 `#策略名` 表达同一件事，
+ * 由 `cleanDnsServer` 映射成 `#PROXY`，渲染期再校验该策略是否存在。
  *
  * 本文件属于 core 纯函数层：无 IO。
  */
@@ -395,9 +397,33 @@ interface GeneralState {
   ignored: string[];
 }
 
+/**
+ * Shadowrocket 的 `#proxy` → mihomo 的 `#策略名`。
+ *
+ * `#proxy` 的意思是「这条 DoH 的请求本身走代理」——不带它的 DoH 在国内网络里
+ * 会被劫持，所以这个后缀不是装饰。mihomo 的表达是
+ * `https://dns.google/dns-query#PROXY`，**不是无法表达**。
+ *
+ * 以前这里把后缀整个剥掉，还在文档里写成「Clash 不能为单个 DoH 服务器指定出口」，
+ * 那句话是错的，代价是 DNS 请求悄悄退回直连解析。
+ *
+ * PROXY 组不一定存在（配置没引用 PROXY 时不会有），所以这里只做语法映射；
+ * 存在性由 resolveOrchestration 在渲染期校验 —— 不存在就剥掉并告警，
+ * 绝不让一条 DNS 配置把整份订阅搞成加载失败。
+ */
 function cleanDnsServer(value: string): string {
-  const withoutProxyTag = value.split('#')[0]?.trim() ?? '';
-  return withoutProxyTag;
+  const trimmed = value.trim();
+  const hash = trimmed.indexOf('#');
+  if (hash === -1) return trimmed;
+
+  const server = trimmed.slice(0, hash).trim();
+  const via = trimmed.slice(hash + 1).trim();
+  if (!server) return '';
+  if (!via) return server;
+
+  if (/^proxy$/i.test(via)) return `${server}#PROXY`;
+  // 其它后缀（`h3`、网卡名）原样保留，交给渲染期判断。
+  return `${server}#${via}`;
 }
 
 function parseSkipProxy(value: string, rules: OrchestrationRule[]): void {
@@ -425,7 +451,7 @@ function parseSkipProxy(value: string, rules: OrchestrationRule[]): void {
   }
 }
 
-function parseGeneralLine(line: string, state: GeneralState, warnings: string[]): void {
+function parseGeneralLine(line: string, state: GeneralState): void {
   const assignment = splitAssignment(line);
   if (!assignment) return;
 
@@ -436,11 +462,6 @@ function parseGeneralLine(line: string, state: GeneralState, warnings: string[])
     case 'dns-server': {
       const servers = splitList(value);
       state.nameserver.push(...servers.map(cleanDnsServer).filter(Boolean));
-      if (servers.some((server) => server.toLowerCase().includes('#proxy'))) {
-        warnings.push(
-          'Shadowrocket 的 dns-server 支持 #proxy，Clash 不能为单个 DoH 服务器指定出口；已按普通 nameserver 输出',
-        );
-      }
       break;
     }
     case 'fallback-dns-server':
@@ -644,7 +665,7 @@ export function parseShadowrocketConf(text: string): ShadowrocketImportResult {
         parseHostLine(line, hostPolicy, hosts, warnings);
         break;
       case 'general':
-        parseGeneralLine(line, general, warnings);
+        parseGeneralLine(line, general);
         break;
       default:
         // [URL Rewrite] / [MITM] / [Map Local] 等与分流无关，静默忽略。

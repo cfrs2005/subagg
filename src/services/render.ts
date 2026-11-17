@@ -61,6 +61,13 @@ export interface RenderOptions {
   subUrl?: string;
   /** .conf 输出自己的 URL，写进 [General] update-url 供 App 检查更新。 */
   confUrl?: string;
+  /**
+   * 规则集转换端点的基址，形如 `https://host/r/<token>`。
+   *
+   * 给了它，`rule-providers[].url` 就指向我们自己的转换端点（格式已归一）；
+   * 不给则保留下游原始 URL —— 预览走的就是这条路，因为预览拿不到 token。
+   */
+  ruleProxyBase?: string;
 }
 
 export interface RenderResult {
@@ -85,6 +92,24 @@ export interface RenderResult {
   userinfoHeader?: string;
   chain?: ChainStats;
   nodes: ProxyNode[];
+}
+
+/**
+ * 有效编排的解析顺序（不含"本次请求的临时编排"，那是预览专用）：
+ *
+ * ```
+ * profile.orchestration > settings.default_orchestration > 内置 IOS_MIGRATED
+ * ```
+ *
+ * 抽成函数是因为它有第二个消费者：`/r/:token/:key` 规则集端点必须用
+ * **同一份**编排去查 provider 的 URL。两边各写一遍，就一定会有一天不一致，
+ * 表现是「配置里引用的规则集，端点说没声明」。
+ */
+export function resolveEffectiveOrchestration(
+  profile: Pick<Profile, 'orchestration'>,
+  settings: { getDefaultOrchestration(): Orchestration | null } | undefined,
+): Orchestration {
+  return profile.orchestration ?? settings?.getDefaultOrchestration() ?? IOS_MIGRATED;
 }
 
 /**
@@ -126,14 +151,21 @@ export function renderProfile(
   // 改一次全局默认，所有没写专属编排的 profile 一起生效。
   const orchestration =
     options.orchestration === undefined
-      ? (profile.orchestration ??
-        deps.settings?.getDefaultOrchestration() ??
-        IOS_MIGRATED)
+      ? resolveEffectiveOrchestration(profile, deps.settings)
       : options.orchestration;
   const emitOptions = {
     ...(options.base64 === undefined ? {} : { base64: options.base64 }),
     // 不相关目标的 emitter 会忽略这些键；传 undefined 也不会改变默认模板。
-    ...(orchestration ? { clash: { orchestration } } : {}),
+    ...(orchestration
+      ? {
+          clash: {
+            orchestration,
+            // 规则集走我们自己的转换端点：客户端只拿得到目标 behavior 对应的
+            // 干净格式，SR 的前导点列表、GitHub blob 地址这类坑在这里被吃掉。
+            ...(options.ruleProxyBase ? { ruleProxyBase: options.ruleProxyBase } : {}),
+          },
+        }
+      : {}),
     ...(resolved.target === 'shadowrocket.conf'
       ? {
           shadowrocketConf: {

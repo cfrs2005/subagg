@@ -133,7 +133,9 @@ describe('parseShadowrocketConf', () => {
     expect(warnings.some((warning) => warning.includes('顶层 select'))).toBe(true);
     expect(warnings.some((warning) => warning.includes('USER-AGENT'))).toBe(true);
     expect(warnings.some((warning) => warning.includes('GitHub 网页地址'))).toBe(true);
-    expect(warnings.some((warning) => warning.includes('dns-server 支持 #proxy'))).toBe(true);
+    // `#proxy` 不再被剥掉：mihomo 用 `#策略名` 表达同一件事，
+    // 丢后缀会让 DoH 请求悄悄退回直连解析（会被污染）。
+    expect(orchestration.dns?.nameserver).toContain('https://dns.google/dns-query#PROXY');
   });
 
   it('解析结果能被 resolveOrchestration 消费', () => {

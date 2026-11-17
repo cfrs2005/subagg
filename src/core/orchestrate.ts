@@ -155,7 +155,15 @@ export interface ResolvedProvider {
   url: string;
   path: string;
   interval: number;
-  format?: 'text' | 'yaml' | 'mrs';
+  /**
+   * **必须显式输出。** mihomo 不写 `format` 时按 `yaml` 解析，而订阅里
+   * 绝大多数规则集是纯文本 —— 解析失败不会报错，只会得到一个空集。
+   * 实测：同一份 `DOMAIN-SUFFIX,openai.com` 文本，加 `format: text` 才命中，
+   * 不加就一路走到 `MATCH`。这条配置错了没人会发现，除了"某个网站不通"。
+   */
+  format: 'text' | 'yaml' | 'mrs';
+  /** 下载规则集时使用的出口。中转到自己域名时用 DIRECT，避免与规则本身互锁。 */
+  proxy?: string;
 }
 
 export interface ResolvedOrchestration {
@@ -632,15 +640,17 @@ function buildProviders(
       continue;
     }
 
-    const format = provider.format;
+    // 缺省补 `text`：不写 format 时 mihomo 按 yaml 解析纯文本规则集，
+    // 结果是静默空集（已用 mihomo 1.19.25 实测确认）。
+    const format = provider.format ?? 'text';
     const resolved: ResolvedProvider = {
       type: 'http',
       behavior,
       url,
-      path: providerPath(key, format ?? 'text'),
+      path: providerPath(key, format),
       interval: clampInt(provider.interval, 60, 604_800, 86_400),
+      format,
     };
-    if (format) resolved.format = format;
     out[key] = resolved;
   }
 
@@ -657,6 +667,69 @@ function cleanServers(value: string[] | undefined): string[] {
     .map((server) => String(server).trim())
     .filter((server) => server.length > 0)
     .slice(0, 20);
+}
+
+/**
+ * bootstrap DNS：纯 IP，用来解析加密 DNS 服务器自己。
+ *
+ * 节点域名也可能落在这里（`proxy-server-nameserver`）—— 机场域名如果被
+ * 自己的代理规则接管，就是死循环，所以必须有一条不经代理的解析通道。
+ */
+const BOOTSTRAP_DNS: readonly string[] = ['223.5.5.5', '119.29.29.29'];
+
+/** 加密 DNS 服务器几乎总是用域名寻址（`https://dns.google/...`），而不是裸 IP。 */
+function isHostnameBased(server: string): boolean {
+  const bare = server.split('#')[0] ?? '';
+  const withoutScheme = bare.replace(/^[a-z0-9+.-]+:\/\//i, '');
+  const host = withoutScheme.split('/')[0]?.replace(/:\d+$/, '') ?? '';
+  if (!host) return false;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return false;
+  return !host.includes(':');
+}
+
+/**
+ * 解析 `服务器#出口` 里的出口后缀。
+ *
+ * Shadowrocket 写 `dns-server = https://dns.google/dns-query#proxy`，意思是
+ * 「解析请求本身走代理」—— 不带 `#proxy` 的 DoH 在国内网络里会被劫持。
+ * mihomo 的原生写法是 `#策略名`（`...dns-query#PROXY`），**不是无法表达**。
+ *
+ * 但策略名必须真实存在，否则客户端会拒载整份配置。所以这里统一校验：
+ * 存在于本次渲染的分组里就保留，否则剥掉后缀（退回直连解析）并告警。
+ */
+function resolveServers(
+  value: string[] | undefined,
+  context: { groups: ReadonlySet<string>; warnings: string[] },
+): string[] {
+  const out: string[] = [];
+
+  for (const raw of cleanServers(value)) {
+    const hash = raw.indexOf('#');
+    if (hash === -1) {
+      out.push(raw);
+      continue;
+    }
+
+    const server = raw.slice(0, hash).trim();
+    const via = raw.slice(hash + 1).trim();
+    if (!server) continue;
+    if (!via) {
+      out.push(server);
+      continue;
+    }
+
+    // `#h3` 是 DoH 的 HTTP/3 开关，与策略名是同一个语法位置，不能当成未知策略。
+    const builtin = /^(direct|reject|pass|h3)$/i.test(via);
+    if (builtin || context.groups.has(via)) {
+      out.push(`${server}#${via}`);
+      continue;
+    }
+
+    context.warnings.push(`DNS 服务器「${server}」指定的出口「${via}」不存在，已改为直连解析`);
+    out.push(server);
+  }
+
+  return out;
 }
 
 /**
@@ -681,10 +754,22 @@ function buildHosts(hosts: Record<string, string> | undefined): Record<string, s
   return Object.keys(out).length ? out : undefined;
 }
 
-function buildDns(dns: OrchestrationDns | undefined): Record<string, unknown> | undefined {
+function buildDns(
+  dns: OrchestrationDns | undefined,
+  context: {
+    groups: ReadonlySet<string>;
+    /**
+     * 显式标了 DIRECT 的域名。它们必须进 `fake-ip-filter`，否则 fake-ip 模式下
+     * 域名会被分到 `198.18.x.x`，直连出去系统不认识这个地址 —— 表现就是
+     * 「公司内网域名打不开」，而规则看起来是对的。
+     */
+    directDomains: readonly string[];
+    warnings: string[];
+  },
+): Record<string, unknown> | undefined {
   if (!dns || dns.enable === false) return undefined;
 
-  const nameserver = cleanServers(dns.nameserver);
+  const nameserver = resolveServers(dns.nameserver, context);
   if (nameserver.length === 0) return undefined;
 
   const out: Record<string, unknown> = {
@@ -695,11 +780,22 @@ function buildDns(dns: OrchestrationDns | undefined): Record<string, unknown> | 
   if (dns.ipv6 !== undefined) out['ipv6'] = dns.ipv6;
   if (dns.enhancedMode) out['enhanced-mode'] = dns.enhancedMode;
 
-  const fallback = cleanServers(dns.fallback);
+  // 加密 DNS 服务器自己是域名（dns.google / cloudflare-dns.com），
+  // 解析它们需要一个纯 IP 的 bootstrap DNS，否则启动就是死锁。
+  // 以前这份配置能跑，纯粹是因为 `hosts:` 里恰好固定了这几个域名。
+  if (nameserver.some(isHostnameBased)) {
+    out['default-nameserver'] = [...BOOTSTRAP_DNS];
+  }
+
+  const fallback = resolveServers(dns.fallback, context);
   if (fallback.length) out['fallback'] = fallback;
 
-  const proxyServerNameserver = cleanServers(dns.proxyServerNameserver);
-  if (proxyServerNameserver.length) out['proxy-server-nameserver'] = proxyServerNameserver;
+  const explicitProxyDns = resolveServers(dns.proxyServerNameserver, context);
+  // 节点域名必须走不经代理的解析通道，否则「解析节点域名 → 走代理 → 需要先解析节点域名」
+  // 就是死循环。显式给了就用给的，没给就用 bootstrap。
+  out['proxy-server-nameserver'] = explicitProxyDns.length
+    ? explicitProxyDns
+    : [...BOOTSTRAP_DNS];
 
   const policy: Record<string, string | string[]> = {};
   const policySource =
@@ -716,10 +812,19 @@ function buildDns(dns: OrchestrationDns | undefined): Record<string, unknown> | 
   }
   if (Object.keys(policy).length) out['nameserver-policy'] = policy;
 
-  const fakeIpFilter = (Array.isArray(dns.fakeIpFilter) ? dns.fakeIpFilter : [])
-    .map((entry) => String(entry).trim())
-    .filter(Boolean)
-    .slice(0, 200);
+  // fake-ip 排除项 = 显式声明的 always-real-ip ∪ 显式标了 DIRECT 的域名。
+  // 后者是这次补的：规则写着「这个域名直连」，但 fake-ip 会把它解析成
+  // 198.18.x.x，直连发出去谁都不认识。规则与 DNS 必须成对。
+  const fakeIpFilter = [
+    ...new Set(
+      [
+        ...(Array.isArray(dns.fakeIpFilter) ? dns.fakeIpFilter : [])
+          .map((entry) => String(entry).trim())
+          .filter(Boolean),
+        ...context.directDomains,
+      ].map((entry) => entry.toLowerCase()),
+    ),
+  ].slice(0, 300);
   if (fakeIpFilter.length) out['fake-ip-filter'] = fakeIpFilter;
 
   return out;
@@ -867,7 +972,11 @@ export function resolveOrchestration(
     warnings,
   };
 
-  const dns = buildDns(spec.dns);
+  const dns = buildDns(spec.dns, {
+    groups: groupNames,
+    directDomains: collectDirectDomains(filteredRules),
+    warnings,
+  });
   if (dns) result.dns = dns;
   const hosts = buildHosts(spec.hosts);
   if (hosts) result.hosts = hosts;
@@ -882,6 +991,35 @@ function isUsablePolicy(
   nodes: ReadonlySet<string>,
 ): boolean {
   return policy === 'DIRECT' || policy === 'REJECT' || groups.has(policy) || nodes.has(policy);
+}
+
+/**
+ * 从已通过的规则里收集显式直连域名，供 `fake-ip-filter` 使用。
+ *
+ * 只取 `DOMAIN` / `DOMAIN-SUFFIX` 且策略为 DIRECT 的规则。`RULE-SET` 里的
+ * 几十万条域名不可能展开、也不该展开 —— 那是规则集自己的事。
+ */
+function collectDirectDomains(rules: readonly string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+
+  for (const line of rules) {
+    const parts = line.split(',');
+    const type = parts[0];
+    if (type !== 'DOMAIN' && type !== 'DOMAIN-SUFFIX') continue;
+    if (parts[2] !== 'DIRECT') continue;
+
+    const value = parts[1]?.trim();
+    if (!value) continue;
+
+    const entry = type === 'DOMAIN-SUFFIX' ? `+.${value}` : value;
+    if (seen.has(entry.toLowerCase())) continue;
+    seen.add(entry.toLowerCase());
+    out.push(entry);
+    if (out.length >= 200) break;
+  }
+
+  return out;
 }
 
 function pickDefaultPolicy(groups: readonly WorkingGroup[]): string {
