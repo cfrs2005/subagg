@@ -348,4 +348,17 @@ CREATE TABLE oauth_login_attempts (
 CREATE INDEX idx_oauth_attempt_expiry ON oauth_login_attempts(expires_at);
 `,
   },
+  {
+    version: 8,
+    name: 'profile_orchestration',
+    sql: `
+-- Clash.Meta 的分流编排（proxy-groups / rules / rule-providers / dns）。
+--
+-- 存 JSON 而不是拆表，理由与 profiles.rule 相同：编排永远整存整取，
+-- 没有任何"按分组内容查询配置文件"的需求。拆表只会多出三四张附属表。
+--
+-- NULL 有明确含义：使用内置的通用模板（与 v7 及以前完全一致）。
+ALTER TABLE profiles ADD COLUMN orchestration TEXT;
+`,
+  },
 ];

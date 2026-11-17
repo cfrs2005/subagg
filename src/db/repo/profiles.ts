@@ -14,6 +14,7 @@ import { randomUUID } from 'node:crypto';
 import type { EmitTarget } from '../../core/emit/index.js';
 import { isEmitTarget } from '../../core/emit/index.js';
 import type { FilterRule } from '../../core/filter.js';
+import type { Orchestration } from '../../core/orchestrate.js';
 import type { UserinfoMode } from '../../core/userinfo.js';
 import type { Db } from '../index.js';
 
@@ -23,6 +24,11 @@ export interface Profile {
   description: string;
   icon: string;
   rule: FilterRule;
+  /**
+   * Clash.Meta 分流编排。NULL 表示使用内置的通用模板 ——
+   * 与这个字段引入之前的行为完全一致，存量配置不需要迁移。
+   */
+  orchestration: Orchestration | null;
   /** UA 认不出客户端时使用的输出格式。 */
   defaultTarget: EmitTarget;
   userinfoMode: UserinfoMode;
@@ -38,6 +44,7 @@ interface ProfileRow {
   description: string;
   icon: string;
   rule: string;
+  orchestration: string | null;
   default_target: string;
   userinfo_mode: string;
   update_interval: number;
@@ -51,6 +58,26 @@ function toUserinfoMode(raw: string): UserinfoMode {
   if (raw.startsWith('follow:')) return raw as UserinfoMode;
   // 数据被手工改坏时的兜底。sum 是最不容易出错的默认值。
   return 'sum';
+}
+
+/**
+ * 解析编排 JSON。
+ *
+ * 与 rule 一样，损坏时退化为 NULL（= 内置模板）而不是让整个配置文件不可用。
+ * 这里不做完整校验 —— 写入路径已经过 zod；读取路径只负责"别崩"，
+ * 真正的结构防御在 resolveOrchestration() 里（它对每个字段都做运行时检查）。
+ */
+function toOrchestration(raw: string | null): Orchestration | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object') return null;
+    const candidate = parsed as Partial<Orchestration>;
+    if (!Array.isArray(candidate.groups) || !Array.isArray(candidate.rules)) return null;
+    return parsed as Orchestration;
+  } catch {
+    return null;
+  }
 }
 
 function toProfile(row: ProfileRow): Profile {
@@ -69,7 +96,8 @@ function toProfile(row: ProfileRow): Profile {
     description: row.description,
     icon: row.icon,
     rule,
-  defaultTarget: isEmitTarget(row.default_target) ? row.default_target : 'shadowrocket',
+    orchestration: toOrchestration(row.orchestration),
+    defaultTarget: isEmitTarget(row.default_target) ? row.default_target : 'shadowrocket',
     userinfoMode: toUserinfoMode(row.userinfo_mode),
     updateInterval: row.update_interval,
     createdAt: row.created_at,
@@ -82,6 +110,7 @@ export interface CreateProfileInput {
   description?: string;
   icon?: string;
   rule?: FilterRule;
+  orchestration?: Orchestration | null;
   defaultTarget?: EmitTarget;
   userinfoMode?: UserinfoMode;
   updateInterval?: number;
@@ -110,9 +139,9 @@ export class ProfileRepo {
     this.db
       .prepare(
         `INSERT INTO profiles
-           (id, name, description, icon, rule, default_target, userinfo_mode,
-            update_interval, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (id, name, description, icon, rule, orchestration, default_target,
+            userinfo_mode, update_interval, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -120,6 +149,7 @@ export class ProfileRepo {
         input.description ?? '',
         input.icon ?? '📦',
         JSON.stringify(input.rule ?? {}),
+        input.orchestration ? JSON.stringify(input.orchestration) : null,
         input.defaultTarget ?? 'shadowrocket',
         input.userinfoMode ?? 'sum',
         input.updateInterval ?? 12,
@@ -137,6 +167,11 @@ export class ProfileRepo {
     if (patch.description !== undefined) columns['description'] = patch.description;
     if (patch.icon !== undefined) columns['icon'] = patch.icon;
     if (patch.rule !== undefined) columns['rule'] = JSON.stringify(patch.rule);
+    // 显式 null 是"清除编排、回到内置模板"，与 undefined（不改）必须区分开。
+    if (patch.orchestration !== undefined) {
+      columns['orchestration'] =
+        patch.orchestration === null ? null : JSON.stringify(patch.orchestration);
+    }
     if (patch.defaultTarget !== undefined) columns['default_target'] = patch.defaultTarget;
     if (patch.userinfoMode !== undefined) columns['userinfo_mode'] = patch.userinfoMode;
     if (patch.updateInterval !== undefined) columns['update_interval'] = patch.updateInterval;

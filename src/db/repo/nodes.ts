@@ -113,6 +113,40 @@ export class NodeRepo {
     run(nodes);
   }
 
+  /**
+   * 添加一条独立节点，不触碰同来源下的其他节点。
+   * 指纹重复时返回 false，让管理接口给出明确的 409，而不是静默覆盖。
+   */
+  addForSubscription(subscriptionId: string, node: ProxyNode, now = Date.now()): boolean {
+    const info = this.db
+      .prepare(
+        `INSERT OR IGNORE INTO nodes
+           (subscription_id, fingerprint, name, type, server, port, region, payload, first_seen, last_seen)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        subscriptionId,
+        node.fingerprint,
+        node.name,
+        node.type,
+        node.server,
+        node.port,
+        node.meta.region ?? null,
+        JSON.stringify(node),
+        now,
+        now,
+      );
+    return info.changes === 1;
+  }
+
+  /** 删除指定来源下的一条节点，避免同指纹的其他订阅节点被误删。 */
+  deleteForSubscription(subscriptionId: string, fingerprint: string): boolean {
+    const info = this.db
+      .prepare('DELETE FROM nodes WHERE subscription_id = ? AND fingerprint = ?')
+      .run(subscriptionId, fingerprint);
+    return info.changes === 1;
+  }
+
   /** 取全部节点。订阅请求的热路径，节点数在几千量级时一次性读入完全可行。 */
   listAll(): StoredNode[] {
     const rows = this.db.prepare('SELECT * FROM nodes').all() as NodeRow[];

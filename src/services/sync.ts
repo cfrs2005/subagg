@@ -66,6 +66,24 @@ function autoTags(node: ProxyNodeDraft): string[] {
   return tags;
 }
 
+/**
+ * 把任意受信来源的一条解析结果放进统一节点模型。
+ * 订阅同步与手动添加共用此入口，保证标签、地区和指纹口径完全一致。
+ */
+export function finalizeSourceNode(
+  draft: ProxyNodeDraft,
+  source: { id: string; name: string },
+): ProxyNode {
+  const meta: NodeMeta = {
+    sourceId: source.id,
+    sourceName: source.name,
+    tags: autoTags(draft),
+  };
+  const region = detectRegion(draft.name, draft.server);
+  if (region) meta.region = region;
+  return finalizeNode(draft, meta);
+}
+
 export class SyncService {
   constructor(private readonly deps: SyncDeps) {}
 
@@ -125,18 +143,9 @@ export class SyncService {
       }
 
       // ── 补齐元信息 ──────────────────────────────────
-      const finalized: ProxyNode[] = parsed.nodes.map((draft) => {
-        const meta: NodeMeta = {
-          sourceId: sub.id,
-          sourceName: sub.name,
-          tags: autoTags(draft),
-        };
-        // 地区推断不出时不写该字段，而不是填一个 'UNKNOWN' 占位 ——
-        // 占位值会污染地区筛选器的选项列表
-        const region = detectRegion(draft.name, draft.server);
-        if (region) meta.region = region;
-        return finalizeNode(draft, meta);
-      });
+      const finalized: ProxyNode[] = parsed.nodes.map((draft) =>
+        finalizeSourceNode(draft, { id: sub.id, name: sub.name }),
+      );
 
       nodes.replaceForSubscription(sub.id, finalized);
       subscriptions.markSynced(sub.id, finalized.length, outcome.etag ?? null);
@@ -178,7 +187,7 @@ export class SyncService {
    * 但多一层保险不会有坏处。
    */
   async syncAll(): Promise<SyncResult[]> {
-    const targets = this.deps.subscriptions.list().filter((s) => s.enabled);
+    const targets = this.deps.subscriptions.listRemote().filter((s) => s.enabled);
     return this.syncMany(targets);
   }
 

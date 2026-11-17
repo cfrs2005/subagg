@@ -11,6 +11,18 @@ import type { Db } from '../index.js';
 import type { SubscriptionFormat } from '../../core/parse/index.js';
 import type { TrafficInfo } from '../../core/types.js';
 
+/**
+ * 手动节点复用 nodes 表的来源外键，但它不是需要抓取的远端订阅。
+ * 固定来源只保存本地节点，不携带用户凭据，也不会进入定时同步。
+ */
+export const MANUAL_NODE_SOURCE_ID = 'manual-nodes';
+export const MANUAL_NODE_SOURCE_NAME = '手动添加';
+const MANUAL_NODE_SOURCE_URL = 'manual://local';
+
+export function isManualNodeSource(id: string): boolean {
+  return id === MANUAL_NODE_SOURCE_ID;
+}
+
 export interface Subscription {
   id: string;
   name: string;
@@ -83,6 +95,11 @@ export class SubscriptionRepo {
     return rows.map(toSubscription);
   }
 
+  /** 只返回用户录入的远端订阅；内部手动节点来源不属于订阅源。 */
+  listRemote(): Subscription[] {
+    return this.list().filter((sub) => !isManualNodeSource(sub.id));
+  }
+
   get(id: string): Subscription | undefined {
     const row = this.db.prepare('SELECT * FROM subscriptions WHERE id = ?').get(id) as
       | SubscriptionRow
@@ -110,6 +127,32 @@ export class SubscriptionRepo {
     const created = this.get(id);
     if (!created) throw new Error('订阅创建后立即读取失败');
     return created;
+  }
+
+  /** 首次添加手动节点时，幂等创建它们共用的本地来源。 */
+  ensureManualNodeSource(now = Date.now()): Subscription {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO subscriptions
+           (id, name, url, format, update_interval, enabled, user_agent, node_count, created_at)
+         VALUES (?, ?, ?, 'uri-list', 720, 0, NULL, 0, ?)`,
+      )
+      .run(MANUAL_NODE_SOURCE_ID, MANUAL_NODE_SOURCE_NAME, MANUAL_NODE_SOURCE_URL, now);
+
+    const source = this.get(MANUAL_NODE_SOURCE_ID);
+    if (!source) throw new Error('手动节点来源创建后立即读取失败');
+    return source;
+  }
+
+  /** 手动增删后只更新节点数，不伪造一次远端同步时间。 */
+  refreshManualNodeCount(): number {
+    const row = this.db
+      .prepare('SELECT COUNT(*) AS count FROM nodes WHERE subscription_id = ?')
+      .get(MANUAL_NODE_SOURCE_ID) as { count: number };
+    this.db
+      .prepare('UPDATE subscriptions SET node_count = ? WHERE id = ?')
+      .run(row.count, MANUAL_NODE_SOURCE_ID);
+    return row.count;
   }
 
   /**

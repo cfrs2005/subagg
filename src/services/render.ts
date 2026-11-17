@@ -18,6 +18,7 @@
 import { emit, resolveTarget, type EmitTarget, type SkippedNode } from '../core/emit/index.js';
 import { applyFilter, type FilterStats } from '../core/filter.js';
 import { expandChain, type ChainStats } from '../core/chain.js';
+import type { Orchestration } from '../core/orchestrate.js';
 import type { ProxyNode, TrafficInfo } from '../core/types.js';
 import { aggregateUserinfo, formatUserinfo } from '../core/userinfo.js';
 import type { Profile } from '../db/repo/profiles.js';
@@ -41,6 +42,13 @@ export interface RenderOptions {
   base64?: boolean;
   /** 覆盖 profile 的 limit。用于预览时只渲染前若干个节点。 */
   limitOverride?: number;
+  /**
+   * 覆盖 profile 的 Clash 编排。用于预览"还没保存的编排"。
+   *
+   * 三态是刻意的：`undefined` = 用 profile 上的；`null` = 明确不用编排
+   * （回退内置模板）；对象 = 用这份临时编排。
+   */
+  orchestration?: Orchestration | null;
 }
 
 export interface RenderResult {
@@ -97,7 +105,13 @@ export function renderProfile(
   const chained = expandChain(filtered.nodes, rule.chain, all);
 
   // ── 3. 生成 ─────────────────────────────────────────
-  const emitOptions = options.base64 === undefined ? {} : { base64: options.base64 };
+  const orchestration =
+    options.orchestration === undefined ? profile.orchestration : options.orchestration;
+  const emitOptions = {
+    ...(options.base64 === undefined ? {} : { base64: options.base64 }),
+    // Clash 之外的 emitter 会忽略它；传 undefined 也不会改变默认模板。
+    ...(orchestration ? { clash: { orchestration } } : {}),
+  };
   const emitted = emit(chained.nodes, resolved.target, emitOptions);
 
   // ── 4. 聚合流量信息 ──────────────────────────────────
@@ -114,6 +128,7 @@ export function renderProfile(
     ...filtered.warnings,
     ...(deps.catalog.warningsForPick?.(rule.pick) ?? []),
     ...chained.warnings,
+    ...(emitted.warnings ?? []),
   ];
   if (resolved.warning) warnings.push(resolved.warning);
   if (emitted.skipped.length > 0) {

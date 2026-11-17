@@ -23,13 +23,22 @@ import { z } from 'zod';
 import type { AppContext } from '../../context.js';
 import { EMIT_TARGETS, TARGET_LABELS, emitUri, type EmitTarget } from '../../core/emit/index.js';
 import { applyFilter, DEFAULT_EXCLUDE_PATTERNS, type FilterRule } from '../../core/filter.js';
+import { parseShadowrocketConf } from '../../core/orchestrate-import.js';
+import { ORCHESTRATION_PRESETS } from '../../core/orchestrate-presets.js';
+import { parseUri } from '../../core/parse/index.js';
 import { knownRegionCodes, regionNameZh, regionToFlag } from '../../core/region.js';
 import { encodeQr, renderQrSvg } from '../../core/qrcode.js';
 import { PROXY_TYPES, type ProxyType } from '../../core/types.js';
 import type { UserinfoMode } from '../../core/userinfo.js';
 import type { IxAuthMode, IxMappingState } from '../../db/repo/ix.js';
+import {
+  isManualNodeSource,
+  MANUAL_NODE_SOURCE_ID,
+  MANUAL_NODE_SOURCE_NAME,
+} from '../../db/repo/subscriptions.js';
 import { tokenRef } from '../../db/repo/sharing.js';
 import { renderProfile } from '../../services/render.js';
+import { finalizeSourceNode } from '../../services/sync.js';
 import { expandChain } from '../../core/chain.js';
 import { requireAdmin } from '../auth.js';
 import { IX_MAX_FINGERPRINTS, type IxAuthModeSchema } from './ix.js';
@@ -115,6 +124,86 @@ const FilterRuleSchema = z.object({
   chain: ChainRuleSchema.optional(),
 });
 
+/**
+ * Clash 分流编排的校验。
+ *
+ * 这里只做"形状与上限"的校验（防止超大对象、非法类型），不做语义校验 ——
+ * 分组是否为空、规则是否引用了不存在的策略，只有拿到真实节点之后才能判断，
+ * 那部分在 core/orchestrate.ts 的 resolveOrchestration() 里做。
+ */
+const OrchestrationSelectorSchema = z.object({
+  nameRegex: z.string().max(200).optional(),
+  excludeNameRegex: z.string().max(200).optional(),
+  source: z.array(z.string().max(200)).max(50).optional(),
+  region: z.array(z.string().length(2)).max(50).optional(),
+  type: z.array(ProxyTypeSchema).max(20).optional(),
+  pick: z.array(z.string().max(200)).max(5000).optional(),
+});
+
+const OrchestrationMemberSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('group'), name: z.string().min(1).max(64) }),
+  z.object({ kind: z.literal('nodes'), select: OrchestrationSelectorSchema }),
+  z.object({ kind: z.literal('policy'), name: z.enum(['DIRECT', 'REJECT']) }),
+]);
+
+const OrchestrationGroupSchema = z.object({
+  name: z.string().min(1).max(64),
+  type: z.enum(['select', 'url-test', 'fallback', 'load-balance']),
+  members: z.array(OrchestrationMemberSchema).max(200),
+  preferred: z.array(z.string().max(200)).max(50).optional(),
+  url: z.string().max(500).optional(),
+  interval: z.number().int().min(60).max(86_400).optional(),
+  tolerance: z.number().int().min(0).max(10_000).optional(),
+  onEmpty: z.enum(['drop', 'direct']).optional(),
+});
+
+const OrchestrationRuleSchema = z.object({
+  type: z.enum([
+    'DOMAIN',
+    'DOMAIN-SUFFIX',
+    'DOMAIN-KEYWORD',
+    'DOMAIN-REGEX',
+    'IP-CIDR',
+    'IP-CIDR6',
+    'GEOIP',
+    'GEOSITE',
+    'RULE-SET',
+    'MATCH',
+  ]),
+  value: z.string().max(2000).optional(),
+  policy: z.string().min(1).max(128),
+  noResolve: z.boolean().optional(),
+});
+
+const OrchestrationProviderSchema = z.object({
+  url: z.string().url().max(500),
+  behavior: z.enum(['domain', 'ipcidr', 'classical']),
+  interval: z.number().int().min(60).max(604_800).optional(),
+  format: z.enum(['text', 'yaml', 'mrs']).optional(),
+});
+
+const OrchestrationDnsSchema = z.object({
+  enable: z.boolean().optional(),
+  ipv6: z.boolean().optional(),
+  enhancedMode: z.enum(['fake-ip', 'redir-host']).optional(),
+  nameserver: z.array(z.string().max(300)).max(20).optional(),
+  fallback: z.array(z.string().max(300)).max(20).optional(),
+  proxyServerNameserver: z.array(z.string().max(300)).max(20).optional(),
+  nameserverPolicy: z
+    .record(z.string().max(200), z.union([z.string().max(300), z.array(z.string().max(300)).max(20)]))
+    .optional(),
+  fakeIpFilter: z.array(z.string().max(200)).max(200).optional(),
+});
+
+const OrchestrationSchema = z.object({
+  groups: z.array(OrchestrationGroupSchema).max(64),
+  rules: z.array(OrchestrationRuleSchema).max(1000),
+  providers: z.record(z.string().max(64), OrchestrationProviderSchema).optional(),
+  dns: OrchestrationDnsSchema.optional(),
+  hosts: z.record(z.string().max(200), z.string().max(200)).optional(),
+  ipv6: z.boolean().optional(),
+});
+
 const TARGET_VALUES = [
   'clash',
   'clash.meta',
@@ -145,11 +234,22 @@ const UpdateSubscriptionSchema = CreateSubscriptionSchema.partial().extend({
   enabled: z.boolean().optional(),
 });
 
+const CreateManualNodeSchema = z.object({
+  name: z.string().max(100).optional(),
+  uri: z
+    .string()
+    .trim()
+    .min(1, '节点链接不能为空')
+    .max(16_384, '节点链接过长')
+    .refine((value) => !/[\r\n]/.test(value), '一次只能添加一个节点链接'),
+});
+
 const CreateProfileSchema = z.object({
   name: z.string().min(1).max(100),
   description: z.string().max(300).optional(),
   icon: z.string().max(8).optional(),
   rule: FilterRuleSchema.optional(),
+  orchestration: OrchestrationSchema.nullable().optional(),
   defaultTarget: TargetSchema.optional(),
   userinfoMode: UserinfoModeSchema.optional(),
   updateInterval: z.number().int().min(1).max(720).optional(),
@@ -191,6 +291,8 @@ const PreviewSchema = z.object({
   target: TargetSchema.optional(),
   /** 预览时只渲染前若干个节点，避免大配置拖慢界面。 */
   limit: z.number().int().min(1).max(200).optional(),
+  /** 预览尚未保存的编排；省略表示按内置模板渲染。 */
+  orchestration: OrchestrationSchema.nullable().optional(),
 });
 
 // ── IX 中转（只留 `/meta` 要发布的界面常量；schema 与路由都在 routes/ix.ts）──
@@ -254,6 +356,9 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
       })),
       presentTypes: ctx.nodes.distinctTypes(),
       defaultExcludePatterns: DEFAULT_EXCLUDE_PATTERNS,
+      // 编排预设直接发完整对象，界面"一键套用"不需要再打一次请求。
+      // 预设是代码里的常量，不含任何用户数据。
+      orchestrationPresets: ORCHESTRATION_PRESETS,
       publicBaseUrl: ctx.config.publicBaseUrl,
       trustProxy: ctx.config.trustProxy,
       shareSourceAlert: ctx.config.shareSourceAlert,
@@ -291,7 +396,7 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
       }));
       const snapshots = ctx.traffic.latestAll();
 
-      const subscriptions = ctx.subscriptions.list().map((sub) => ({
+      const subscriptions = ctx.subscriptions.listRemote().map((sub) => ({
         ...sub,
         traffic: snapshots.get(sub.id) ?? null,
       }));
@@ -324,7 +429,7 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
     });
 
     // ── 订阅源 ────────────────────────────────────────
-    app.get('/subscriptions', async () => ctx.subscriptions.list());
+    app.get('/subscriptions', async () => ctx.subscriptions.listRemote());
 
     app.post('/subscriptions', async (req, reply) => {
       const parsed = CreateSubscriptionSchema.safeParse(req.body);
@@ -341,6 +446,9 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
     });
 
     app.patch<{ Params: { id: string } }>('/subscriptions/:id', async (req, reply) => {
+      if (isManualNodeSource(req.params.id)) {
+        return reply.code(404).send({ error: '订阅源不存在' });
+      }
       const parsed = UpdateSubscriptionSchema.safeParse(req.body);
       if (!parsed.success) return reply.code(400).send(badRequest(parsed.error.issues));
 
@@ -350,12 +458,18 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
     });
 
     app.delete<{ Params: { id: string } }>('/subscriptions/:id', async (req, reply) => {
+      if (isManualNodeSource(req.params.id)) {
+        return reply.code(404).send({ error: '订阅源不存在' });
+      }
       const ok = ctx.subscriptions.delete(req.params.id);
       if (!ok) return reply.code(404).send({ error: '订阅源不存在' });
       return reply.code(204).send();
     });
 
     app.post<{ Params: { id: string } }>('/subscriptions/:id/sync', async (req, reply) => {
+      if (isManualNodeSource(req.params.id)) {
+        return reply.code(404).send({ error: '订阅源不存在' });
+      }
       const sub = ctx.subscriptions.get(req.params.id);
       if (!sub) return reply.code(404).send({ error: '订阅源不存在' });
       return ctx.sync.syncOne(sub);
@@ -374,6 +488,42 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
     });
 
     // ── 节点 ──────────────────────────────────────────
+    app.post('/nodes', async (req, reply) => {
+      const parsed = CreateManualNodeSchema.safeParse(req.body);
+      if (!parsed.success) return reply.code(400).send(badRequest(parsed.error.issues));
+
+      const outcome = parseUri(parsed.data.uri);
+      if (!outcome.ok) return reply.code(400).send({ error: outcome.reason });
+
+      const draft = parsed.data.name?.trim()
+        ? { ...outcome.node, name: parsed.data.name.trim() }
+        : outcome.node;
+      ctx.subscriptions.ensureManualNodeSource();
+      const node = finalizeSourceNode(draft, {
+        id: MANUAL_NODE_SOURCE_ID,
+        name: MANUAL_NODE_SOURCE_NAME,
+      });
+      if (!ctx.nodes.addForSubscription(MANUAL_NODE_SOURCE_ID, node)) {
+        return reply.code(409).send({ error: '这个手动节点已经存在' });
+      }
+      ctx.subscriptions.refreshManualNodeCount();
+      ctx.logger.info('手动节点已添加', {
+        fingerprint: node.fingerprint,
+        type: node.type,
+      });
+      return reply.code(201).send({
+        fingerprint: node.fingerprint,
+        name: node.name,
+        type: node.type,
+        server: node.server,
+        port: node.port,
+        region: node.meta.region ?? null,
+        sourceId: node.meta.sourceId,
+        sourceName: node.meta.sourceName,
+        manual: true,
+      });
+    });
+
     app.get('/nodes', async () => {
       // 只返回元信息，不含凭据 —— 见文件头部的说明
       const latestPings = ctx.pingHistory.latestAll();
@@ -395,8 +545,17 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
         providerId: entry.providerId ?? null,
         relayState: entry.relayState ?? null,
         relayError: entry.relayError ?? null,
+        manual: entry.kind === 'source' && isManualNodeSource(entry.sourceId),
         ping: latestPings.get(entry.fingerprint) ?? null,
       }));
+    });
+
+    app.delete<{ Params: { fingerprint: string } }>('/nodes/:fingerprint', async (req, reply) => {
+      const deleted = ctx.nodes.deleteForSubscription(MANUAL_NODE_SOURCE_ID, req.params.fingerprint);
+      if (!deleted) return reply.code(404).send({ error: '手动节点不存在' });
+      ctx.subscriptions.refreshManualNodeCount();
+      ctx.logger.info('手动节点已删除', { fingerprint: req.params.fingerprint });
+      return reply.code(204).send();
     });
 
     app.get<{ Params: { fingerprint: string } }>('/nodes/:fingerprint/uri', async (req, reply) => {
@@ -536,6 +695,7 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
           description: '',
           icon: '👁',
           rule,
+          orchestration: parsed.data.orchestration ?? null,
           defaultTarget: parsed.data.target ?? 'shadowrocket',
           userinfoMode: 'sum',
           updateInterval: 12,
@@ -547,6 +707,9 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
           // 预览时不做 base64：一坨 base64 对人类没有任何信息量
           base64: false,
           limitOverride: parsed.data.limit ?? 50,
+          // 预览是独立的一次性渲染，不读取任何已保存 profile 的编排；
+          // 没传就按内置模板渲染。
+          orchestration: parsed.data.orchestration ?? null,
         },
       );
 
@@ -572,6 +735,22 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
         bodyPreview: rendered.body.slice(0, 4000),
         bodyTruncated: rendered.body.length > 4000,
       };
+    });
+
+    /**
+     * 从 Shadowrocket / Surge 配置导入编排。
+     *
+     * 放在服务端而不是浏览器里，是因为解析逻辑要与 core 的编排模型
+     * 严格共用一份 —— 前端再实现一遍必然长歪，而这里的输出要直接
+     * 存进 profile，不能有第二个"差不多"的版本。
+     */
+    app.post('/orchestration/parse', async (req, reply) => {
+      const parsed = z
+        .object({ text: z.string().min(1).max(200_000) })
+        .safeParse(req.body);
+      if (!parsed.success) return reply.code(400).send(badRequest(parsed.error.issues));
+
+      return parseShadowrocketConf(parsed.data.text);
     });
 
     // ── IX 中转 ───────────────────────────────────────
@@ -743,7 +922,7 @@ export function createAdminRoutes(ctx: AppContext): FastifyPluginAsync {
     // ── 流量 ──────────────────────────────────────────
     app.get('/traffic', async () => {
       const latest = ctx.traffic.latestAll();
-      return ctx.subscriptions.list().map((sub) => ({
+      return ctx.subscriptions.listRemote().map((sub) => ({
         subscriptionId: sub.id,
         name: sub.name,
         updateInterval: sub.updateInterval,

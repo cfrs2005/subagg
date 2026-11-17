@@ -30,8 +30,11 @@ import { renderProfile } from '../../services/render.js';
  * 这里只对非 ASCII 字符做百分号编码，ASCII 部分保持可读，
  * 便于用 `curl -I` 直接查看。
  */
-function toHeaderValue(value: string): string {
-  return value.replace(/[^\x20-\x7e]/g, (ch) => encodeURIComponent(ch));
+function toHeaderValue(value: string, maxLength = 3000): string {
+  const encoded = value.replace(/[^\x20-\x7e]/g, (ch) => encodeURIComponent(ch));
+  // HTTP 头有总长度上限。编排校验可能一次产生几十条告警，
+  // 这里截断而不是让响应头超限导致整个请求失败。
+  return encoded.length > maxLength ? `${encoded.slice(0, maxLength)}…` : encoded;
 }
 
 interface SubParams {
@@ -230,6 +233,7 @@ export function createSubRoutes(ctx: AppContext): FastifyPluginAsync {
         }
         if (result.warnings.length > 0) {
           reply.header('x-subagg-warning', toHeaderValue(result.warnings.join(' | ')));
+          reply.header('x-subagg-warning-count', String(result.warnings.length));
         }
 
         ctx.logger.info('订阅已下发', {

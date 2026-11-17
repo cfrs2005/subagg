@@ -69,6 +69,7 @@ function profile(pick: string[]): Profile {
     description: '',
     icon: '📦',
     rule: { pick, pickMode: 'only', useDefaultExclude: false },
+    orchestration: null,
     defaultTarget: 'clash.meta',
     userinfoMode: 'off',
     updateInterval: 12,

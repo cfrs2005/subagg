@@ -22,6 +22,7 @@
 
 import { stringify as stringifyYaml } from 'yaml';
 import { regionNameZh, regionToFlag } from '../region.js';
+import { resolveOrchestration, type Orchestration } from '../orchestrate.js';
 import type { ProxyNode, TlsOptions, Transport } from '../types.js';
 import { partitionBySupport, type EmitResult } from './capability.js';
 
@@ -34,6 +35,13 @@ export interface ClashEmitOptions {
   regionGroups?: boolean;
   /** 延迟测试用的 URL。默认用 Google 的 204 端点。 */
   testUrl?: string;
+  /**
+   * 自定义分流编排。给了就用它替换内置的分组与规则。
+   *
+   * 只对 `clash.meta` 生效：`rule-providers` 是 Clash Premium / Meta 的特性，
+   * 塞给原版 Clash 会导致整份配置加载失败。
+   */
+  orchestration?: Orchestration;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -246,7 +254,10 @@ interface ProxyGroup {
  * ——所有订阅都过期了，或者过滤规则写得太严。此时回退到只含 `DIRECT` 的分组，
  * 保证配置本身仍然合法可加载，用户至少能打开客户端看到问题所在。
  */
-function buildGroups(nodes: readonly ProxyNode[], opts: Required<ClashEmitOptions>): ProxyGroup[] {
+function buildGroups(
+  nodes: readonly ProxyNode[],
+  opts: { testUrl: string; regionGroups: boolean },
+): ProxyGroup[] {
   const names = nodes.map((n) => n.name);
 
   if (names.length === 0) {
@@ -362,27 +373,51 @@ function buildRules(): string[] {
  * 不支持的节点会被跳过并记入返回值的 `skipped`，由调用方负责上报给用户。
  */
 export function emitClash(nodes: readonly ProxyNode[], options: ClashEmitOptions): EmitResult {
-  const opts: Required<ClashEmitOptions> = {
-    target: options.target,
-    withGroups: options.withGroups ?? true,
-    regionGroups: options.regionGroups ?? true,
-    testUrl: options.testUrl ?? DEFAULT_TEST_URL,
-  };
+  const target = options.target;
+  const withGroups = options.withGroups ?? true;
+  const testUrl = options.testUrl ?? DEFAULT_TEST_URL;
+  const { usable, skipped } = partitionBySupport(nodes, target);
 
-  const { usable, skipped } = partitionBySupport(nodes, opts.target);
+  const warnings: string[] = [];
+  let orchestration: ReturnType<typeof resolveOrchestration> | undefined;
+
+  if (withGroups && options.orchestration) {
+    if (target !== 'clash.meta') {
+      warnings.push(
+        '自定义编排包含 rule-providers / DNS 等 mihomo 专属能力，当前目标不是 Clash.Meta，已回退内置模板',
+      );
+    } else {
+      orchestration = resolveOrchestration(usable, options.orchestration);
+      warnings.push(...orchestration.warnings);
+    }
+  }
 
   const config: Record<string, unknown> = {
-    // 最小顶层配置。刻意不含 external-controller / DNS ——
-    // 那些是用户对自己客户端的选择，订阅不该越俎代庖。
+    // 最小顶层配置。刻意不含 external-controller ——
+    // 那是用户对自己客户端的选择，订阅不该越俎代庖。
     'mixed-port': 7890,
     'allow-lan': false,
     mode: 'rule',
     'log-level': 'info',
-    proxies: usable.map(toClashProxy),
   };
 
-  if (opts.withGroups) {
-    config['proxy-groups'] = buildGroups(usable, opts);
+  if (orchestration?.ipv6 !== undefined) config['ipv6'] = orchestration.ipv6;
+  if (orchestration?.hosts) config['hosts'] = orchestration.hosts;
+
+  config['proxies'] = usable.map(toClashProxy);
+
+  if (withGroups && orchestration) {
+    if (orchestration.groups.length > 0) config['proxy-groups'] = orchestration.groups;
+    if (Object.keys(orchestration.providers).length > 0) {
+      config['rule-providers'] = orchestration.providers;
+    }
+    config['rules'] = orchestration.rules;
+    if (orchestration.dns) config['dns'] = orchestration.dns;
+  } else if (withGroups) {
+    config['proxy-groups'] = buildGroups(usable, {
+      testUrl,
+      regionGroups: options.regionGroups ?? true,
+    });
     config['rules'] = buildRules();
   }
 
@@ -392,11 +427,13 @@ export function emitClash(nodes: readonly ProxyNode[], options: ClashEmitOptions
     lineWidth: 0,
   });
 
-  return {
+  const result: EmitResult = {
     body,
     // Clash 客户端对 Content-Type 不敏感，但 text/yaml 便于在浏览器里直接查看
     contentType: 'text/yaml; charset=utf-8',
     nodeCount: usable.length,
     skipped,
   };
+  if (warnings.length > 0) result.warnings = warnings;
+  return result;
 }

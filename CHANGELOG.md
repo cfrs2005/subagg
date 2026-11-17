@@ -6,6 +6,20 @@
 ## [Unreleased]
 
 ### Added
+- Per-profile Clash.Meta orchestration: declarative proxy groups
+  (`select` / `url-test` / `fallback` / `load-balance`) resolved from node
+  selectors, ordered rules with external `rule-providers`, DNS policy and
+  static `hosts`. Profiles without orchestration keep the built-in template,
+  and Shadowrocket output is unchanged.
+- `POST /api/orchestration/parse` imports a Shadowrocket / Surge `.conf` into
+  orchestration, translating `[Proxy Group]`, `[Rule]`, `[Host]`, `skip-proxy`,
+  `dns-server` and `ipv6`, and reporting every construct Clash cannot express.
+- Built-in `ios-migrated` orchestration preset derived from the author's
+  long-running Shadowrocket policy.
+- Database migration version 8 adds `profiles.orchestration`.
+- Manual single-node import and deletion in the node workspace. Pasted proxy URIs
+  use the same parser, fingerprint, filter, ping, output, and chain-routing path
+  as subscription nodes, while remote sync leaves them untouched.
 - Production Google OIDC login with an exact owner-only email policy, PKCE,
   state/nonce validation, revocable hashed application sessions, CSRF protection,
   logout, public privacy/terms pages, and a production-disabled local development fallback.

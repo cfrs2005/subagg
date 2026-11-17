@@ -57,6 +57,7 @@ describe('profile rendering with independent chain roles', () => {
           landing: { pick: landings.map((item) => item.fingerprint) },
         },
       },
+      orchestration: null,
       defaultTarget: 'shadowrocket',
       userinfoMode: 'off',
       updateInterval: 12,

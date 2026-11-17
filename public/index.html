@@ -10,7 +10,7 @@
     if (localStorage.getItem('subagg.theme') === 'dark') document.documentElement.dataset.theme = 'dark';
   } catch (_) { /* Private browsing may reject localStorage. */ }
 </script>
-<link rel="stylesheet" href="./style.css?v=20260827-ui-pass">
+<link rel="stylesheet" href="./style.css?v=20260901-manual-node">
 </head>
 <body>
 <div class="gate" id="gate">
@@ -71,7 +71,7 @@
     </div>
     <div class="tab-body">
       <div class="pane active" id="pane-nodes">
-        <div class="page-actions"><div><h2>节点列表</h2><p>查看、筛选和测试当前订阅中的节点。</p></div><div class="page-action-buttons"><button class="btn-sec" id="syncBtn">↻ 全部同步</button><button class="btn-sec" id="pingAllBtn" data-action="ping-all-nodes">ϟ 测试全部节点</button><button class="btn-pri" id="newProfileBtn">＋ 添加配置</button></div></div>
+        <div class="page-actions"><div><h2>节点列表</h2><p>查看、筛选和测试订阅或手动添加的节点。</p></div><div class="page-action-buttons"><button class="btn-sec" id="syncBtn">↻ 全部同步</button><button class="btn-sec" id="pingAllBtn" data-action="ping-all-nodes">ϟ 测试全部节点</button><button class="btn-sec" id="addNodeBtn">＋ 添加节点</button><button class="btn-pri" id="newProfileBtn">＋ 添加配置</button></div></div>
         <div class="node-stats" id="nodeStats"></div>
         <div class="filter-bar redesigned-filter"><div class="search-wrap"><span>⌕</span><input class="search" type="text" id="searchQ" placeholder="搜索节点名称 / 服务器地址..."></div><select class="select filter-select" id="nodeSourceFilter"><option value="">全部来源</option></select><select class="select filter-select" id="nodeRegionFilter"><option value="">全部地区</option></select><select class="select filter-select" id="nodeTypeFilter"><option value="">全部协议</option></select><select class="select filter-select" id="nodeStatusFilter"><option value="">全部状态</option><option value="online">在线</option><option value="offline">离线</option><option value="unknown">未测试</option></select><select class="select filter-select" id="nodeSort"><option value="default">默认顺序</option><option value="name">名称</option><option value="port">端口</option><option value="status">连通状态</option><option value="latency">TCP 延迟</option></select><button class="filter-reset" data-action="reset-node-filters">↻ 重置</button><span class="fsumm" id="fsumm"></span></div>
         <div class="node-workspace"><section class="node-list-card"><div class="table-scroll"><table class="ntable"><thead><tr><th class="pick-cell"><input type="checkbox" disabled></th><th>节点名称</th><th>协议</th><th>地区</th><th>服务器</th><th>端口</th><th>延迟</th><th>状态</th><th>来源</th><th>中转</th><th>操作</th></tr></thead><tbody id="nodeBody"></tbody></table></div><div class="table-foot"><span id="nodeFootCount">显示 0 条</span><div class="pagination" id="nodePagination"></div></div></section></div>
@@ -88,6 +88,6 @@
 
 <div class="overlay" id="overlay"><div class="modal" id="modal"></div></div>
 <div class="toasts" id="toasts"></div>
-<script type="module" src="./app.js?v=20260826-chain-name"></script>
+<script type="module" src="./app.js?v=20260901-manual-node"></script>
 </body>
 </html>

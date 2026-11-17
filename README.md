@@ -48,11 +48,18 @@ at a nearby relay entry rather than at your provider directly. See
 
 ## Features
 
-- **Multi-source aggregation** — Clash YAML and base64 URI-list subscriptions,
-  auto-detected. Protocols: VMess, VLESS (incl. REALITY), Trojan, Shadowsocks,
-  ShadowsocksR, Hysteria2, TUIC.
+- **Multi-source aggregation and single-node import** — Clash YAML and base64
+  URI-list subscriptions are auto-detected, and one proxy URI can be pasted
+  directly. Manual nodes use the same filters, checks, output, and chain routing,
+  and remote subscription sync never overwrites them. Protocols: VMess, VLESS
+  (incl. REALITY), Trojan, Shadowsocks, ShadowsocksR, Hysteria2, TUIC.
 - **One link, many clients** — Clash / Clash.Meta (mihomo) / Shadowrocket / v2rayN,
   picked automatically by User-Agent.
+- **Per-profile Clash orchestration** — declarative proxy groups, rules,
+  rule-providers, DNS policy, and static hosts resolved from node selectors at
+  render time, so upstream node renames never break the config. A built-in
+  `ios-migrated` preset and a Shadowrocket `.conf` importer translate an
+  existing iOS policy into mihomo semantics.
 - **Filter rules decoupled from output format** — the same rule set produces every
   format. Filter by region, protocol, source, regex include/exclude, or hand-pick
   nodes in the UI. Plus dedupe, rename templates, sorting and limits.
@@ -77,8 +84,9 @@ at a nearby relay entry rather than at your provider directly. See
 
 ### Node management
 
-Filter, inspect, and test every node in one compact workspace. The included
-example has been redacted before publication.
+Add, filter, inspect, and test every node in one compact workspace. Paste a
+VMess, VLESS, Trojan, SS, SSR, Hysteria2, or TUIC URI, or keep importing whole
+subscription sources. The included example has been redacted before publication.
 
 ![Node management workspace](./assets/screenshots/node-management.png)
 

@@ -851,7 +851,7 @@ function renderNodes(nodes) {
 
   if (state.nodes.length === 0) {
     body.innerHTML = `<tr><td colspan="11"><div class="empty">
-      还没有任何节点<br><b>先在左侧添加一个订阅源</b>
+      还没有任何节点<br><b>添加一个节点，或在左侧添加订阅源</b>
     </div></td></tr>`;
     renderNodePagination(0);
     return;
@@ -930,7 +930,7 @@ function renderNodes(nodes) {
       <td><span class="status-pill ${status}"><i></i>${statusLabel}</span></td>
       <td class="nsrc">${esc(node.sourceName)}</td>
       <td>${ixCell}</td>
-      <td class="row-actions">${node.usable === false ? '' : `<button class="icon-action" data-action="ping-node" data-fp="${esc(node.fingerprint)}" title="测试 TCP 连通性">ϟ</button><button class="icon-action" data-action="copy-node" data-fp="${esc(node.fingerprint)}" title="复制 URI">↗</button>`}<button class="icon-action" data-action="select-node" data-fp="${esc(node.fingerprint)}" title="查看详情">⋮</button>${node.kind === 'ix-relay' ? `<button class="icon-action danger" data-action="ix-delete-relay" data-fp="${esc(node.fingerprint)}" title="删除 IX 节点与远端端口">×</button>` : ''}</td>
+      <td class="row-actions">${node.usable === false ? '' : `<button class="icon-action" data-action="ping-node" data-fp="${esc(node.fingerprint)}" title="测试 TCP 连通性">ϟ</button><button class="icon-action" data-action="copy-node" data-fp="${esc(node.fingerprint)}" title="复制 URI">↗</button>`}<button class="icon-action" data-action="select-node" data-fp="${esc(node.fingerprint)}" title="查看详情">⋮</button>${node.kind === 'ix-relay' ? `<button class="icon-action danger" data-action="ix-delete-relay" data-fp="${esc(node.fingerprint)}" title="删除 IX 节点与远端端口">×</button>` : node.manual ? `<button class="icon-action danger" data-action="delete-manual-node" data-fp="${esc(node.fingerprint)}" title="删除手动节点">×</button>` : ''}</td>
     </tr>`;
   }).join('');
 
@@ -1028,7 +1028,7 @@ function openNodeDetail(node) {
   const statusLabel = node.usable === false ? '不可用' : status === 'online' ? '在线' : status === 'offline' ? '离线' : '未测试';
   openModal(`
     <div class="node-modal-head"><div><div class="detail-kicker">NODE DETAIL</div><h2>${regionFlag(node.region)} ${esc(node.name)}</h2><p>${esc(node.sourceName)} · ${esc(node.type.toUpperCase())}</p></div><button class="node-modal-close" data-action="close-modal" aria-label="关闭节点详情">×</button></div>
-    <div class="node-modal-actions"><span class="status-pill ${status}"><i></i>${statusLabel}</span>${node.usable === false ? '' : `<button class="btn-sec" data-action="ping-node" data-fp="${esc(node.fingerprint)}">ϟ 测试连接</button><button class="btn-sec" data-action="copy-node" data-fp="${esc(node.fingerprint)}">↗ 复制 URI</button><button class="btn-sec" data-action="node-qr" data-fp="${esc(node.fingerprint)}" data-value="${esc(node.name)}">▦ 二维码</button>`}${node.kind === 'ix-relay' ? `<button class="btn-danger" data-action="ix-delete-relay" data-fp="${esc(node.fingerprint)}">删除 IX 节点</button>` : ''}</div>
+    <div class="node-modal-actions"><span class="status-pill ${status}"><i></i>${statusLabel}</span>${node.usable === false ? '' : `<button class="btn-sec" data-action="ping-node" data-fp="${esc(node.fingerprint)}">ϟ 测试连接</button><button class="btn-sec" data-action="copy-node" data-fp="${esc(node.fingerprint)}">↗ 复制 URI</button><button class="btn-sec" data-action="node-qr" data-fp="${esc(node.fingerprint)}" data-value="${esc(node.name)}">▦ 二维码</button>`}${node.kind === 'ix-relay' ? `<button class="btn-danger" data-action="ix-delete-relay" data-fp="${esc(node.fingerprint)}">删除 IX 节点</button>` : node.manual ? `<button class="btn-danger" data-action="delete-manual-node" data-fp="${esc(node.fingerprint)}">删除节点</button>` : ''}</div>
     ${node.kind === 'ix-relay' ? `<div class="${node.usable === false ? 'err-box' : 'field-hint'}">原节点：<code>${esc(node.originFingerprint ?? '')}</code>${node.relayError ? `<br>${esc(node.relayError)}` : ''}</div>` : ''}
     <div class="node-detail-grid"><div><span>地区</span><strong>${regionTag(node.region, node.region)}</strong></div><div><span>服务器</span><strong class="detail-code">${esc(node.server)}</strong></div><div><span>端口</span><strong>${node.port}</strong></div><div><span>TCP 延迟</span><strong class="${status === 'online' ? 'metric-ok' : ''}">${ping?.ok ? `${ping.latencyMs ?? 0}ms` : '—'}</strong></div><div><span>最近测试</span><strong>${ping ? fmtTime(ping.checkedAt) : '尚未测试'}</strong></div><div><span>节点指纹</span><strong class="detail-code">${esc(node.fingerprint)}</strong></div></div>
     <section class="latency-history"><div class="latency-history-head"><div><div class="detail-kicker">LATENCY HISTORY</div><h3>延迟趋势</h3></div><span>每 ${state.meta?.nodePingIntervalHours ?? 12} 小时自动测试</span></div><div id="nodeLatencyHistory" data-fingerprint="${esc(node.fingerprint)}"><div class="latency-history-empty">正在读取最近 90 天数据…</div></div></section>
@@ -1377,6 +1377,42 @@ function closeModal() {
   modalEl.innerHTML = '';
 }
 
+function manualNodeModal() {
+  openModal(`
+    <div class="modal-title">添加节点</div>
+    <div class="modal-sub">粘贴一条完整节点链接。添加后可直接筛选、测速、生成订阅或配置链式代理。</div>
+    <div class="field">
+      <label class="field-label" for="m-node-name">名称（可选）</label>
+      <input class="input" id="m-node-name" maxlength="100" placeholder="留空时使用链接内的名称">
+    </div>
+    <div class="field">
+      <label class="field-label" for="m-node-uri">节点链接</label>
+      <textarea class="textarea manual-node-uri" id="m-node-uri" maxlength="16384" spellcheck="false" placeholder="vless://… / vmess://… / trojan://… / ss://…"></textarea>
+      <div class="field-hint">一次添加一条。支持 VMess、VLESS、Trojan、SS、SSR、Hysteria2 和 TUIC。</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-sec" data-action="close-modal">取消</button>
+      <button class="btn-pri" data-action="save-manual-node">添加节点</button>
+    </div>
+  `);
+  document.getElementById('m-node-uri')?.focus();
+}
+
+async function saveManualNode() {
+  const payload = {
+    name: document.getElementById('m-node-name').value.trim() || undefined,
+    uri: document.getElementById('m-node-uri').value.trim(),
+  };
+  if (!payload.uri) {
+    toast('请粘贴节点链接', 'error');
+    return;
+  }
+  const created = await api.post('/nodes', payload);
+  closeModal();
+  await loadAll();
+  toast(`已添加 ${created.name}`);
+}
+
 // ── 二维码弹窗 ────────────────────────────────────────
 //
 // 出码在服务端本地算（src/core/qrcode.ts），不经任何第三方服务。
@@ -1592,11 +1628,63 @@ function openProfilePage(profile, seedRule) {
         description: '',
         icon: '📦',
         rule: seedRule ?? { useDefaultExclude: true, dedupe: 'server-port', sort: 'region' },
+        orchestration: null,
         defaultTarget: 'shadowrocket',
         userinfoMode: 'sum',
         updateInterval: 12,
       };
+  orchestrationDraft = orchestrationText(editingProfile.orchestration);
   renderProductProfilePage();
+}
+
+// ── Clash 编排草稿 ────────────────────────────────────
+//
+// 编排是一个 JSON 对象，用 textarea 编辑。草稿单独存一份字符串而不是
+// 每次输入都 JSON.parse：用户打到一半必然是不合法 JSON，实时解析只会
+// 让他每敲一个字符就看到一次报错。
+let orchestrationDraft = '';
+
+function orchestrationText(orchestration) {
+  return orchestration ? JSON.stringify(orchestration, null, 2) : '';
+}
+
+/** 把 textarea 里的草稿解析成对象。空文本 = 不用编排（null）。 */
+function parseOrchestrationDraft() {
+  const text = orchestrationDraft.trim();
+  if (!text) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    throw new Error(`编排 JSON 解析失败：${err.message}`);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('编排必须是一个 JSON 对象');
+  }
+  if (!Array.isArray(parsed.groups) || !Array.isArray(parsed.rules)) {
+    throw new Error('编排必须包含 groups 与 rules 两个数组');
+  }
+  return parsed;
+}
+
+function writeOrchestrationDraft(value) {
+  orchestrationDraft = value;
+  const textarea = document.getElementById('p-orch-json');
+  if (textarea) textarea.value = value;
+  const pill = document.querySelector('.pe-orch-card .pe-count-pill');
+  if (pill) pill.textContent = value.trim() ? '已启用' : '内置模板';
+}
+
+function renderOrchestrationWarnings(warnings) {
+  const el = document.getElementById('p-orch-warnings');
+  if (!el) return;
+  if (!warnings?.length) {
+    el.innerHTML = '';
+    return;
+  }
+  el.innerHTML = `<strong>导入提示（${warnings.length}）</strong><ul>${warnings
+    .map((warning) => `<li>${esc(warning)}</li>`)
+    .join('')}</ul>`;
 }
 
 /**
@@ -1944,6 +2032,7 @@ function renderProductProfilePage() {
   const isEditing = Boolean(profile.id);
   const regions = state.meta?.presentRegions ?? [];
   const types = state.meta?.presentTypes ?? [];
+  const presets = state.meta?.orchestrationPresets ?? [];
   const targetOrder = ['shadowrocket', 'clash.meta', 'clash', 'v2ray'];
   const targets = targetOrder.map((value) => state.meta?.targets.find((target) => target.value === value)).filter(Boolean);
   const editor = document.getElementById('pane-profile-editor');
@@ -1953,13 +2042,41 @@ function renderProductProfilePage() {
     <div class="pe-shell">
       <header class="pe-header"><div class="pe-brand"><button class="pe-back" data-action="close-modal" title="返回">←</button><div><div class="pe-kicker">SUBSCRIPTION PROFILE</div><h1>${isEditing ? '编辑配置文件' : '新建配置文件'}</h1></div></div><div class="pe-header-actions">${isEditing ? `<button class="btn-danger" data-action="delete-profile-request" data-id="${esc(profile.id)}">删除配置</button>` : ''}<span class="pe-status"><i></i>草稿自动保存于本地页面</span><button class="btn-sec" data-action="close-modal">取消</button><button class="btn-pri" data-action="save-profile">${isEditing ? '保存修改' : '创建配置'}</button></div></header>
       <div class="pe-layout">
-        <aside class="pe-rail"><div class="pe-rail-label">配置步骤</div><div class="pe-rail-item active"><b>01</b><span>基础信息</span></div><div class="pe-rail-item"><b>02</b><span>节点筛选</span></div><div class="pe-rail-item"><b>03</b><span>链式代理</span><em>可选</em></div><div class="pe-rail-item"><b>04</b><span>输出设置</span></div><div class="pe-rail-note"><strong>设计原则</strong><p>先选择，再配置。保存后可随时编辑，不需要先理解输出文件。</p></div></aside>
+        <aside class="pe-rail"><div class="pe-rail-label">配置步骤</div><div class="pe-rail-item active"><b>01</b><span>基础信息</span></div><div class="pe-rail-item"><b>02</b><span>节点筛选</span></div><div class="pe-rail-item"><b>03</b><span>链式代理</span><em>可选</em></div><div class="pe-rail-item"><b>04</b><span>输出设置</span></div><div class="pe-rail-item"><b>05</b><span>分流编排</span><em>Clash</em></div><div class="pe-rail-note"><strong>设计原则</strong><p>先选择，再配置。保存后可随时编辑，不需要先理解输出文件。</p></div></aside>
         <main class="pe-main">
           <section class="pe-hero"><div class="pe-icon-input"><input class="input" id="p-icon" value="${esc(profile.icon)}" maxlength="2"><small>图标</small></div><div class="pe-hero-fields"><label class="field"><span class="field-label">配置名称</span><input class="input pe-title-input" id="p-name" value="${esc(profile.name)}" placeholder="例如：日常办公节点"></label><label class="field"><span class="field-label">描述</span><input class="input" id="p-desc" value="${esc(profile.description)}" placeholder="给自己看的用途说明"></label></div></section>
           <section class="pe-card"><div class="pe-card-head"><div><div class="pe-kicker">01 · SELECT</div><h2>节点筛选</h2><p>先缩小候选范围，再决定是否添加链式节点。IX 派生节点可以和原节点一样直接选择。</p></div><span class="pe-count-pill">${state.nodes.filter((node) => node.usable !== false).length} 个可用节点</span></div><div class="pe-filter-grid"><div class="pe-filter-block"><span class="field-label">地区</span><div class="chip-group" id="p-regions">${regions.map((reg) => `<button class="chip${r.regions?.includes(reg.code) ? ' on' : ''}" data-action="rule-region" data-value="${esc(reg.code)}">${reg.flag} ${esc(reg.name)}</button>`).join('') || '<span class="pe-empty">暂无地区数据</span>'}</div></div><div class="pe-filter-block"><span class="field-label">协议</span><div class="chip-group" id="p-types">${types.map((type) => `<button class="chip${r.types?.includes(type) ? ' on' : ''}" data-action="rule-type" data-value="${esc(type)}">${esc(type.toUpperCase())}</button>`).join('') || '<span class="pe-empty">暂无协议数据</span>'}</div></div></div></section>
           ${profileNodePickerHtml()}
           ${chainPickerHtml()}
           <section class="pe-card"><div class="pe-card-head"><div><div class="pe-kicker">02 · REFINE</div><h2>高级筛选</h2><p>常用场景不需要打开这里。需要时再添加包含或排除条件。</p></div></div><div class="pe-advanced-grid"><div><div class="pe-subhead">包含条件</div><div id="p-include">${exprRows(r.include, 'include')}</div><button class="mini-btn" data-action="add-expr" data-kind="include">+ 添加包含条件</button></div><div><div class="pe-subhead">排除条件</div><div id="p-exclude">${exprRows(r.exclude, 'exclude')}</div><button class="mini-btn" data-action="add-expr" data-kind="exclude">+ 添加排除条件</button></div></div></section>
+          <section class="pe-card pe-orch-card">
+            <div class="pe-card-head">
+              <div>
+                <div class="pe-kicker">03 · CLASH</div>
+                <h2>Clash 分流编排</h2>
+                <p>留空 = 使用内置模板。Clash.Meta 客户端会拿到这里的 proxy-groups、rules、rule-providers 与 dns；Shadowrocket 订阅只带节点，不受影响。</p>
+              </div>
+              <span class="pe-count-pill">${orchestrationDraft.trim() ? '已启用' : '内置模板'}</span>
+            </div>
+            <div class="pe-orch-toolbar">
+              <select class="select" id="p-orch-preset">
+                <option value="">选择预设…</option>
+                ${presets.map((preset) => `<option value="${esc(preset.id)}">${esc(preset.name)}</option>`).join('')}
+              </select>
+              <button class="mini-btn" data-action="apply-orchestration-preset">套用预设</button>
+              <button class="mini-btn" data-action="format-orchestration">格式化 JSON</button>
+              <button class="mini-btn" data-action="clear-orchestration">清空（回到内置模板）</button>
+            </div>
+            <textarea class="textarea pe-orch-json" id="p-orch-json" spellcheck="false"
+              placeholder="留空即使用内置模板。启用后这里是一份 Orchestration JSON：groups / rules / providers / dns。">${esc(orchestrationDraft)}</textarea>
+            <details class="pe-orch-import">
+              <summary>从 Shadowrocket 配置导入</summary>
+              <p>粘贴完整的 .conf 全文。只导入 [Proxy Group] / [Rule] / [Host] / [General]；节点仍由订阅提供。</p>
+              <textarea class="textarea pe-orch-source" id="p-orch-src" spellcheck="false" placeholder="[Proxy Group]&#10;PROXY = select,自动选择,节点A&#10;&#10;[Rule]&#10;DOMAIN-SUFFIX,openai.com,AI&#10;FINAL,PROXY"></textarea>
+              <button class="mini-btn" data-action="parse-orchestration">解析并填入</button>
+            </details>
+            <div class="pe-orch-warnings" id="p-orch-warnings"></div>
+          </section>
         </main>
         <aside class="pe-inspector"><div class="pe-inspector-head"><div class="pe-kicker">CONFIGURATION</div><h2>输出设置</h2><p>普通订阅与链式订阅使用同一个配置文件。</p></div><div class="pe-inspector-section"><span class="field-label">默认客户端</span><select class="select" id="p-target">${targets.map((target) => `<option value="${esc(target.value)}"${profile.defaultTarget === target.value ? ' selected' : ''}>${esc(target.label)}</option>`).join('')}</select><small>客户端带有明确 User-Agent 时会自动选择对应格式。</small></div><div class="pe-inspector-section"><span class="field-label">去重方式</span><select class="select" id="p-dedupe"><option value="off"${r.dedupe === 'off' ? ' selected' : ''}>不去重</option><option value="server-port"${r.dedupe === 'server-port' ? ' selected' : ''}>服务器 + 端口</option><option value="fingerprint"${r.dedupe === 'fingerprint' ? ' selected' : ''}>完整指纹</option></select><span class="field-label pe-label-gap">排序</span><select class="select" id="p-sort">${[['none','保持原顺序'],['region','按地区'],['name','按名称'],['type','按协议'],['source','按订阅源']].map(([value,label]) => `<option value="${value}"${r.sort === value ? ' selected' : ''}>${label}</option>`).join('')}</select></div><div class="pe-inspector-section"><span class="field-label">节点数量上限</span><input class="input" id="p-limit" type="number" min="0" max="5000" value="${r.limit ?? 0}"><small>0 表示不限制。链式配对会在此筛选之后生成。</small></div><div class="pe-inspector-section"><span class="field-label">重命名模板</span><input class="input" id="p-rename" value="${esc(r.rename?.[0]?.replace ?? '')}" placeholder="{flag} {regionZh} {index2}"><small>留空保持原名。</small></div><div class="pe-inspector-section"><span class="field-label">流量信息</span><select class="select" id="p-userinfo"><option value="sum"${profile.userinfoMode === 'sum' ? ' selected' : ''}>合计所有订阅源</option><option value="off"${profile.userinfoMode === 'off' ? ' selected' : ''}>不输出</option>${state.subscriptions.map((sub) => `<option value="follow:${esc(sub.id)}"${profile.userinfoMode === `follow:${sub.id}` ? ' selected' : ''}>跟随「${esc(sub.name)}」</option>`).join('')}</select></div><label class="checkbox-row pe-exclude-toggle"><input type="checkbox" id="p-defexc" ${r.useDefaultExclude !== false ? 'checked' : ''}>过滤机场信息节点</label>${r.pick?.length ? `<div class="pe-selected-note">已固定选择 ${r.pick.length} 个节点<button class="mini-btn" data-action="clear-rule-pick">清除</button></div>` : ''}</aside>
       </div>
@@ -2112,11 +2229,21 @@ function refreshPreview() {
 }
 
 async function saveProfile() {
+  let orchestration;
+  try {
+    orchestration = parseOrchestrationDraft();
+  } catch (err) {
+    toast(err.message, 'error');
+    return;
+  }
+
   const payload = {
     name: document.getElementById('p-name').value.trim(),
     description: document.getElementById('p-desc').value.trim(),
     icon: document.getElementById('p-icon').value.trim() || '📦',
     rule: collectProductRule(),
+    // null 是"清空编排、回到内置模板"的显式信号；省略则服务端不改。
+    orchestration,
     defaultTarget: document.getElementById('p-target').value,
     userinfoMode: document.getElementById('p-userinfo').value,
   };
@@ -2634,6 +2761,25 @@ document.addEventListener('click', async (e) => {
         await saveSubscription(id || null);
         break;
 
+      case 'save-manual-node':
+        await saveManualNode();
+        break;
+
+      case 'delete-manual-node': {
+        const node = state.nodes.find((item) => item.fingerprint === fp && item.manual);
+        if (!node) {
+          toast('手动节点不存在或已经删除', 'warn');
+          break;
+        }
+        if (!confirm(`删除手动节点「${node.name}」？`)) break;
+        await api.del(`/nodes/${encodeURIComponent(fp)}`);
+        state.picked.delete(fp);
+        closeModal();
+        await loadAll();
+        toast('手动节点已删除');
+        break;
+      }
+
       case 'delete-sub':
         if (!confirm('删除该订阅源？它的节点也会一并删除。')) break;
         await api.del(`/subscriptions/${encodeURIComponent(id)}`);
@@ -2856,6 +3002,55 @@ document.addEventListener('click', async (e) => {
       case 'del-expr':
         document.querySelector(`.expr-row[data-kind="${kind}"][data-index="${index}"]`)?.remove();
         break;
+
+      // ── Clash 编排 ──
+      case 'apply-orchestration-preset': {
+        const presetId = document.getElementById('p-orch-preset').value;
+        const preset = (state.meta?.orchestrationPresets ?? []).find((item) => item.id === presetId);
+        if (!preset) {
+          toast('请先选择一个预设', 'warn');
+          break;
+        }
+        writeOrchestrationDraft(orchestrationText(preset.orchestration));
+        renderOrchestrationWarnings([]);
+        toast(`已套用「${preset.name}」`);
+        break;
+      }
+
+      case 'format-orchestration': {
+        try {
+          writeOrchestrationDraft(orchestrationText(parseOrchestrationDraft()));
+          toast('已格式化');
+        } catch (err) {
+          toast(err.message, 'error');
+        }
+        break;
+      }
+
+      case 'clear-orchestration':
+        writeOrchestrationDraft('');
+        renderOrchestrationWarnings([]);
+        toast('已回到内置模板；保存后生效');
+        break;
+
+      case 'parse-orchestration': {
+        const source = document.getElementById('p-orch-src').value.trim();
+        if (!source) {
+          toast('请先粘贴 Shadowrocket 配置', 'warn');
+          break;
+        }
+        try {
+          const result = await api.post('/orchestration/parse', { text: source });
+          writeOrchestrationDraft(orchestrationText(result.orchestration));
+          renderOrchestrationWarnings(result.warnings);
+          toast(
+            `已解析：${result.orchestration.groups.length} 个分组、${result.orchestration.rules.length} 条规则`,
+          );
+        } catch (err) {
+          toast(err.message, 'error');
+        }
+        break;
+      }
 
       // ── token ──
       case 'links':
@@ -3196,6 +3391,13 @@ document.addEventListener('input', (e) => {
   if (e.target.id === 'p-node-search') {
     profileNodePickerQuery = e.target.value;
     refreshProfileNodePicker(true);
+    return;
+  }
+  if (e.target.id === 'p-orch-json') {
+    // 只更新草稿，不实时 JSON.parse —— 用户打到一半必然不合法。
+    orchestrationDraft = e.target.value;
+    const pill = document.querySelector('.pe-orch-card .pe-count-pill');
+    if (pill) pill.textContent = orchestrationDraft.trim() ? '已启用' : '内置模板';
   }
 });
 document.addEventListener('change', (e) => {
@@ -3288,6 +3490,7 @@ function closeProfilePage() {
   editingProfile = null;
   chainPickerQuery = '';
   profileNodePickerQuery = '';
+  orchestrationDraft = '';
   activateTab('profiles');
 }
 document.querySelectorAll('.tab, .side-nav-item[data-tab]').forEach((tab) => {
@@ -3316,6 +3519,7 @@ document.getElementById('syncBtn').addEventListener('click', async (e) => {
 });
 
 document.getElementById('addSubBtn').addEventListener('click', () => subscriptionModal(null));
+document.getElementById('addNodeBtn').addEventListener('click', manualNodeModal);
 document.getElementById('newProfileBtn').addEventListener('click', () => openProfilePage(null));
 document.getElementById('newProfileBtnDuplicate').addEventListener('click', () => openProfilePage(null));
 document.getElementById('addFriendBtn').addEventListener('click', () => friendModal(null));

@@ -45,11 +45,17 @@ N 个上游订阅
 
 ## 功能
 
-- **多源聚合** —— 自动识别 Clash YAML 与 base64 URI 列表两种订阅格式。
+- **多源聚合与单节点录入** —— 自动识别 Clash YAML 与 base64 URI 列表两种订阅格式，
+  也可直接粘贴一条节点 URI。手动节点使用同一套筛选、测速、输出和链式代理流程，
+  且不会被订阅同步覆盖。
   支持协议：VMess、VLESS（含 REALITY）、Trojan、Shadowsocks、ShadowsocksR、
   Hysteria2、TUIC。
 - **一条链接通吃** —— Clash / Clash.Meta(mihomo) / Shadowrocket / v2rayN
   按 UA 自动匹配。
+- **按配置的 Clash 分流编排** —— 分组、规则、rule-providers、DNS 策略与静态
+  hosts 全部声明式，渲染期由节点选择器解析成真实节点名，机场改名也不会让
+  配置失效。内置 `ios-migrated` 预设和 Shadowrocket `.conf` 导入器，可把
+  现成的 iOS 策略翻译成 mihomo 语义。
 - **过滤规则与输出格式解耦** —— 同一份规则可生成所有格式。可按地区、协议、
   订阅源、正则包含/排除筛选，也可以在界面上直接勾选节点。另有去重、
   重命名模板、排序与数量上限。
@@ -71,7 +77,9 @@ N 个上游订阅
 
 ### 节点管理
 
-在一个紧凑工作区中筛选、查看和测试全部节点。公开图片已经过脱敏处理。
+在一个紧凑工作区中添加、筛选、查看和测试全部节点。可粘贴 VMess、VLESS、
+Trojan、SS、SSR、Hysteria2 或 TUIC 节点 URI，也可继续使用订阅源批量导入。
+公开图片已经过脱敏处理。
 
 ![节点管理工作区](./assets/screenshots/node-management.png)
 

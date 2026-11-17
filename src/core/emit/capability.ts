@@ -162,6 +162,11 @@ export interface EmitResult {
   nodeCount: number;
   /** 因目标格式不支持而跳过的节点。 */
   skipped: SkippedNode[];
+  /**
+   * 生成过程中发现、但没有严重到让整份配置失败的问题。
+   * 例如：编排里的某个分组解析后为空被丢弃、规则引用了不存在的策略。
+   */
+  warnings?: string[];
 }
 
 /**
