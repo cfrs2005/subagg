@@ -68,6 +68,13 @@
 - 数据库迁移 version 6 `ix_remote_port_refs` 为共享远端端口引用查询增加索引。
 
 ### Fixed
+- Fallback / url-test groups from a Shadowrocket config are now translated into
+  an outer `select` (manually switchable, preferred node first) plus an inner
+  `<name>-AUTO` group carrying the original auto-test type and options. Previously
+  the types were copied verbatim, and Clash only allows manual selection inside
+  `select` groups — so users saw "every group is unclickable". The `.conf` output
+  collapses the wrapper back to `url-test`/`fallback` + `policy-select-name`, so
+  the Shadowrocket side stays byte-for-byte faithful.
 - `ios-migrated` preset is now the **faithful output of importing the owner's
   actual Shadowrocket conf** (snapshot embedded in code, parsed by the same
   importer the UI uses) instead of a hand-written approximation: exact per-node
