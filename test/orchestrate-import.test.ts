@@ -67,24 +67,26 @@ describe('parseShadowrocketConf', () => {
   it('解析分组、规则、DNS 与 skip-proxy', () => {
     const { orchestration, warnings } = parseShadowrocketConf(SAMPLE);
 
-    // 自动组（fallback/url-test）在 Clash 里不可手动切换，统一翻成
-    // 外层 select + 内层 <name>-AUTO，外层保留首选顺序。
+    // 顶层 PROXY 只列服务器组（Shadowrocket 的 PROXY = 当前出口），
+    // 组内自适应；不再把每个节点平铺进来。
+    const proxy = orchestration.groups.find((group) => group.name === 'PROXY');
+    expect(proxy?.type).toBe('select');
+    expect(
+      proxy?.members.map((member) => (member.kind === 'group' ? member.name : member.kind)),
+    ).toEqual(['♻️ 自动选择', 'GOOGLE', 'AI-CLAUDE', 'AI-OPENAI', 'policy']);
+
     const google = orchestration.groups.find((group) => group.name === 'GOOGLE');
-    expect(google?.type).toBe('select');
+    expect(google?.type).toBe('fallback');
     expect(google?.preferred).toEqual(['DMIT-VIA-US-LOS-CG']);
-    const googleAuto = orchestration.groups.find((group) => group.name === 'GOOGLE-AUTO');
-    expect(googleAuto?.type).toBe('fallback');
-    expect(googleAuto?.url).toBe('http://www.gstatic.com/generate_204');
-    expect(googleAuto?.interval).toBe(600);
+    expect(google?.url).toBe('http://www.gstatic.com/generate_204');
+    expect(google?.interval).toBe(600);
 
     const claude = orchestration.groups.find((group) => group.name === 'AI-CLAUDE');
-    expect(claude?.type).toBe('select');
-    expect(claude?.members[0]).toEqual(
-      expect.objectContaining({ kind: 'nodes' }),
-    );
-    const claudeAuto = orchestration.groups.find((group) => group.name === 'AI-CLAUDE-AUTO');
-    expect(claudeAuto?.type).toBe('url-test');
-    expect(claudeAuto?.tolerance).toBe(100);
+    expect(claude?.type).toBe('url-test');
+    expect(claude?.tolerance).toBe(100);
+    expect(claude?.preferred).toEqual(['VERIZON-VIA-BWG']);
+    // 同一出口的节点由组内测速自适应，不再拆 -AUTO 子组。
+    expect(orchestration.groups.some((group) => group.name.endsWith('-AUTO'))).toBe(false);
 
     // 没有 PROXY 分组但规则引用了它 → 自动补一个。
     expect(orchestration.groups.some((group) => group.name === 'PROXY')).toBe(true);
@@ -128,7 +130,7 @@ describe('parseShadowrocketConf', () => {
 
     // 明确告诉用户哪些东西没迁移过去。
     expect(warnings.some((warning) => warning.includes('extended-matching'))).toBe(true);
-    expect(warnings.some((warning) => warning.includes('已翻译为外层 select'))).toBe(true);
+    expect(warnings.some((warning) => warning.includes('顶层 select'))).toBe(true);
     expect(warnings.some((warning) => warning.includes('USER-AGENT'))).toBe(true);
     expect(warnings.some((warning) => warning.includes('GitHub 网页地址'))).toBe(true);
     expect(warnings.some((warning) => warning.includes('dns-server 支持 #proxy'))).toBe(true);
@@ -143,18 +145,13 @@ describe('parseShadowrocketConf', () => {
     );
 
     const google = resolved.groups.find((group) => group.name === 'GOOGLE');
-    expect(google?.proxies).toEqual(['DMIT-VIA-US-LOS-CG', 'DMIT-SS2022', 'GOOGLE-AUTO']);
-    const googleAuto = resolved.groups.find((group) => group.name === 'GOOGLE-AUTO');
-    expect(googleAuto?.proxies).toEqual(['DMIT-VIA-US-LOS-CG', 'DMIT-SS2022']);
+    expect(google?.proxies).toEqual(['DMIT-VIA-US-LOS-CG', 'DMIT-SS2022']);
 
     const claude = resolved.groups.find((group) => group.name === 'AI-CLAUDE');
     expect(claude?.proxies).toEqual([
       'VERIZON-VIA-BWG',
       'VERIZON-VIA-TXSH',
-      'AI-CLAUDE-AUTO',
     ]);
-    const claudeAuto = resolved.groups.find((group) => group.name === 'AI-CLAUDE-AUTO');
-    expect(claudeAuto?.proxies).toEqual(['VERIZON-VIA-BWG', 'VERIZON-VIA-TXSH']);
 
     expect(resolved.rules.at(-1)).toBe('MATCH,PROXY');
     expect(resolved.rules).toContain('RULE-SET,openai,AI-OPENAI');
@@ -188,11 +185,10 @@ describe('parseShadowrocketConf', () => {
     );
 
     const auto = orchestration.groups.find((group) => group.name === 'AUTO');
-    expect(auto?.type).toBe('select');
+    expect(auto?.type).toBe('url-test');
     expect(auto?.members).toEqual([
       { kind: 'nodes', select: {} },
       { kind: 'nodes', select: { nameRegex: '^VERIZON-' } },
-      { kind: 'group', name: 'AUTO-AUTO' },
     ]);
     expect(orchestration.rules.some((rule) => rule.type === 'DOMAIN-REGEX')).toBe(true);
   });

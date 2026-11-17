@@ -482,56 +482,7 @@ function parseGeneralLine(line: string, state: GeneralState, warnings: string[])
 //  兜底分组
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Shadowrocket / Surge 的自动组（url-test / fallback / load-balance）都允许
- * 在界面里**手动指定节点**，指定后优先使用、失败再回到自动；Clash 的
- * 同名类型却是纯自动、完全不可点选。直接照抄类型，用户在客户端里会觉得
- * "所有分组都点不动"。
- *
- * 忠实且可用的翻译是：外层 `select`（首个成员 = 首选节点，可任意切换）
- * + 内层 `<name>-AUTO`（保留原类型与测速参数）。规则仍指向原组名，
- * 默认行为仍是"首选优先"，想交给自动时点内层组即可。
- *
- * 注：`policy-regex-filter` / `include-all-proxies` 这类选项在 select 外层
- * 不需要重复，成员已经解析成真实节点。
- */
-function wrapAutoGroups(groups: OrchestrationGroup[], warnings: string[]): OrchestrationGroup[] {
-  const names = new Set(groups.map((group) => group.name));
-  const out: OrchestrationGroup[] = [];
-
-  for (const group of groups) {
-    if (group.type === 'select') {
-      out.push(group);
-      continue;
-    }
-
-    let autoName = `${group.name}-AUTO`;
-    for (let index = 2; names.has(autoName); index += 1) {
-      autoName = `${group.name}-AUTO-${index}`;
-    }
-
-    // 外层：原成员（preferred 会被解析器提前）+ 自动子组。
-    out.push({
-      name: group.name,
-      type: 'select',
-      members: [...group.members, { kind: 'group', name: autoName }],
-      ...(group.preferred?.length ? { preferred: [...group.preferred] } : {}),
-    });
-    // 内层：保留原类型、测速参数与成员（preferred 只属于外层）。
-    out.push({
-      ...group,
-      name: autoName,
-      preferred: undefined,
-    });
-
-    names.add(autoName);
-    warnings.push(
-      `分组「${group.name}」原为 ${group.type}（Clash 中不可手动切换），已翻译为外层 select + 内层自动组「${autoName}」`,
-    );
-  }
-
-  return out;
-}
+const ALL_NODES_GROUP = '♻️ 自动选择';
 
 function ensureGroups(orchestration: Orchestration, warnings: string[]): void {
   const names = new Set(orchestration.groups.map((group) => group.name));
@@ -539,15 +490,6 @@ function ensureGroups(orchestration: Orchestration, warnings: string[]): void {
   const wantsProxy = orchestration.rules.some(
     (rule) => rule.policy === 'PROXY' || rule.policy === 'GLOBAL',
   );
-  if (wantsProxy && !names.has('PROXY')) {
-    orchestration.groups.unshift({
-      name: 'PROXY',
-      type: 'select',
-      members: [{ kind: 'nodes', select: {} }],
-    });
-    names.add('PROXY');
-    warnings.push('规则引用了 PROXY 但配置里没有该分组，已自动创建一个包含全部节点的 select 组');
-  }
 
   if (orchestration.groups.length === 0) {
     orchestration.groups.push({
@@ -557,6 +499,38 @@ function ensureGroups(orchestration: Orchestration, warnings: string[]): void {
     });
     names.add('PROXY');
     warnings.push('配置里没有任何分组，已自动创建一个 PROXY 组');
+  } else if (wantsProxy && !names.has('PROXY')) {
+    // Shadowrocket 的 PROXY 是内置"当前出口"：它可以指向任意策略组。
+    // 这里照搬语义 —— 顶层 PROXY 只列"服务器组"，每个组内部自适应；
+    // 全部节点收进一个自动组作为默认出口，避免把几十个节点平铺进顶层。
+    const otherGroups = orchestration.groups
+      .filter((group) => group.name !== 'PROXY')
+      .map((group) => group.name);
+
+    if (!names.has(ALL_NODES_GROUP)) {
+      orchestration.groups.unshift({
+        name: ALL_NODES_GROUP,
+        type: 'url-test',
+        members: [{ kind: 'nodes', select: {} }],
+        url: 'http://www.gstatic.com/generate_204',
+        interval: 300,
+        tolerance: 50,
+      });
+      names.add(ALL_NODES_GROUP);
+    }
+
+    const members: OrchestrationMember[] = [
+      { kind: 'group', name: ALL_NODES_GROUP },
+      ...otherGroups
+        .filter((name) => name !== ALL_NODES_GROUP)
+        .map((name) => ({ kind: 'group' as const, name })),
+      { kind: 'policy', name: 'DIRECT' },
+    ];
+
+    orchestration.groups.unshift({ name: 'PROXY', type: 'select', members });
+    warnings.push(
+      '规则引用了 PROXY，已自动创建顶层 select：自动选择 + 各服务器组 + DIRECT（组内按测速自适应）',
+    );
   }
 
   const hasMatch = orchestration.rules.some((rule) => rule.type === 'MATCH');
@@ -721,7 +695,6 @@ export function parseShadowrocketConf(text: string): ShadowrocketImportResult {
     );
   }
 
-  orchestration.groups = wrapAutoGroups(orchestration.groups, warnings);
   ensureGroups(orchestration, warnings);
 
   return { orchestration, warnings };

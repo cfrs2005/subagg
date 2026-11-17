@@ -363,34 +363,37 @@ describe('内置预设', () => {
 
     const resolved = resolveOrchestration(prodLike, IOS_MIGRATED);
 
-    // GOOGLE 外层 select（可手动切换）只含 conf 点名的两台 + 自动子组 —— 不是所有 DMIT-*。
+    // GOOGLE 只含 conf 点名的两台 —— 不是所有 DMIT-*。
     const google = resolved.groups.find((group) => group.name === 'GOOGLE');
-    expect(google?.type).toBe('select');
-    expect(google?.proxies).toEqual(['DMIT-via-US-LOS-CG', 'DMIT-ss2022', 'GOOGLE-AUTO']);
-    const googleAuto = resolved.groups.find((group) => group.name === 'GOOGLE-AUTO');
-    expect(googleAuto?.type).toBe('fallback');
-    expect(googleAuto?.proxies).toEqual(['DMIT-via-US-LOS-CG', 'DMIT-ss2022']);
+    expect(google?.type).toBe('fallback');
+    expect(google?.proxies).toEqual(['DMIT-via-US-LOS-CG', 'DMIT-ss2022']);
 
-    // AI-CLAUDE：首选在前 + 其余精确成员 + 内层 url-test。
+    // 同一出口的 VERIZON 节点：组内自适应，不再拆 -AUTO。
     const claude = resolved.groups.find((group) => group.name === 'AI-CLAUDE');
-    expect(claude?.proxies).toEqual([
-      'verizon-via-bwg',
-      'verizon-via-txsh',
-      'verizon-via-dmit',
-      'AI-CLAUDE-AUTO',
-    ]);
-    const claudeAuto = resolved.groups.find((group) => group.name === 'AI-CLAUDE-AUTO');
-    expect(claudeAuto?.proxies).toEqual(['verizon-via-bwg', 'verizon-via-txsh', 'verizon-via-dmit']);
+    expect(claude?.type).toBe('url-test');
+    expect(claude?.proxies).toEqual(['verizon-via-bwg', 'verizon-via-txsh', 'verizon-via-dmit']);
 
     // AI-OPENAI：精确两台，不含 IX_ 派生。
-    const openaiAuto = resolved.groups.find((group) => group.name === 'AI-OPENAI-AUTO');
-    expect(openaiAuto?.proxies).toEqual(['GANBEI-via-TXSH', 'GANBEI-via-DMIT']);
+    const openai = resolved.groups.find((group) => group.name === 'AI-OPENAI');
+    expect(openai?.proxies).toEqual(['GANBEI-via-TXSH', 'GANBEI-via-DMIT']);
+
+    // 顶层 PROXY 只列服务器组 + 全部节点自动组，不再平铺节点。
+    const proxy = resolved.groups.find((group) => group.name === 'PROXY');
+    expect(proxy?.type).toBe('select');
+    expect(proxy?.proxies).toEqual([
+      '♻️ 自动选择',
+      'GOOGLE',
+      'AI-CLAUDE',
+      'AI-OPENAI',
+      'DIRECT',
+    ]);
+    expect(resolved.groups.some((group) => group.name.endsWith('-AUTO'))).toBe(false);
 
     // 指向具体节点的规则：大小写不同也要命中，并回写成真实节点名。
     expect(resolved.rules).toContain('DOMAIN-SUFFIX,drleao.cn,DMIT-via-US-LOS-CG');
 
     // 用户 conf 里没有的东西不能凭空出现。
-    expect(JSON.stringify(resolved.groups)).not.toContain('PROXY,url=');
+    expect(JSON.stringify(resolved.groups)).not.toContain('-AUTO');
   });
 
   it('规则策略大小写不敏感归一：命中后回写真实节点名', () => {
